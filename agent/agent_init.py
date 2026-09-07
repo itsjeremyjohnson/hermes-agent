@@ -1345,6 +1345,8 @@ def _apply_agent_section(agent, _agent_cfg):
             from tools.env_probe import warm_environment_probe_async
             warm_environment_probe_async()
 
+    agent._bot_mode_manager = _agent_section.get("bot_mode_manager", False) is True
+
     # "Bot Chat" gate hint for hosts that defer the DB title write past the first prompt build.
     agent._session_title_hint = None
 

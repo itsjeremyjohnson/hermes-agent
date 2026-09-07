@@ -323,7 +323,9 @@ def _bot_mode_parts(agent: Any) -> List[str]:
             _sdb = getattr(agent, "_session_db", None)
             _sid = getattr(agent, "session_id", None)
             _title = str((_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or "").strip()
-        _bot_section = get_bot_mode_protocol_section(_agent_home(agent)) if _title == BOT_CHAT_TITLE else None
+        _bot_section = get_bot_mode_protocol_section(
+            _agent_home(agent), manager=getattr(agent, "_bot_mode_manager", False) is True
+        ) if _title == BOT_CHAT_TITLE else None
         if _bot_section:
             parts.append(_bot_section)
             # Capability epoch lets the restore path rebuild ONCE per

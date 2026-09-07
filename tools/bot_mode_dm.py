@@ -54,9 +54,9 @@ def _default_home() -> str:
     return os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
 
 
-def message_agent_tool_schema() -> dict:
+def message_agent_tool_schema(*, manager: bool = False) -> dict:
     """OpenAI-format schema for ``message_agent`` (injected, not registered)."""
-    return {
+    schema = {
         "type": "function",
         "function": {
             "name": MESSAGE_AGENT_TOOL_NAME,
@@ -107,6 +107,11 @@ def message_agent_tool_schema() -> dict:
         },
     }
 
+    if manager:
+        from tools.bot_mode_batch import configure_manager_schema
+        configure_manager_schema(schema)
+    return schema
+
 
 def message_agent_authorized(agent: Any) -> bool:
     """The ``message_agent`` gate: a protocol-enabled agent whose session is a managed
@@ -142,7 +147,7 @@ def ensure_message_agent_tool(agent: Any) -> bool:
             return False
         if agent.tools is None:
             agent.tools = []
-        agent.tools.append(message_agent_tool_schema())
+        agent.tools.append(message_agent_tool_schema(manager=getattr(agent, "_bot_mode_manager", False) is True))
         valid = getattr(agent, "valid_tool_names", None)
         if isinstance(valid, set):
             valid.add(MESSAGE_AGENT_TOOL_NAME)
@@ -171,9 +176,13 @@ def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | No
     return json.dumps(payload)
 
 
-def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None) -> str:
+def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None,
+                       assignments: Optional[list] = None) -> str:
     """Deliver ``message`` to ``target``'s Bot Chat. Returns a JSON ack/error.
     ``agent`` is the calling AIAgent — used for the Bot Chat gate and sender identity."""
+    if assignments is not None:
+        from tools.bot_mode_batch import dispatch_batch
+        return dispatch_batch(assignments, target=target, message=message, task_id=task_id, agent=agent)
     home = _agent_home(agent)
     try:
         from tools.bot_mode_probe import (
@@ -464,12 +473,17 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None,
             return _err(f"Delivery to {label} failed to start: no process id returned")
         # From here the background runner owns the file (removed after the consumer finishes).
         transferred = True
+        if getattr(agent, "_bot_mode_manager", False) is True:
+            guidance = ("Dispatch any remaining ready independent assignments before ending your turn. "
+                        "Do not wait or poll; review automatic returns as they arrive.")
+        else:
+            guidance = ("Finish your turn now; when the delivery completes, its notification "
+                        "carries the reply — relay it then, attributed to that agent.")
         return json.dumps({
             "status": "sent",
             "to": label,
             "detail": (f"Message dispatched to {label}. This is asynchronous — do NOT wait "
-                       "or poll. Finish your turn now; when the delivery completes, its "
-                       "notification carries the reply — relay it then, attributed to that agent."),
+                       f"or poll. {guidance}"),
             "process_id": proc_id,
             "sent_at": int(time.time()),
         })

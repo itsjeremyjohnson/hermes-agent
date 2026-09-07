@@ -31,7 +31,7 @@ def strip_legacy_protocol(text: str) -> str:
 BOT_CHAT_TITLE = "Bot Chat"
 
 _lock = threading.Lock()
-_cached: dict[str, str] = {}
+_cached: dict[tuple[str, bool], str] = {}
 
 
 # ── shared path / roster helpers ─────────────────────────────────────────────
@@ -190,7 +190,7 @@ def _peer_paragraph(root: Path) -> str:
     )
 
 
-def _build_section(home: Path) -> str:
+def _build_section(home: Path, *, manager: bool = False) -> str:
     root = _hermes_root(home)
     me = _profile_name(home)
     if not _any_managed(root):
@@ -199,27 +199,56 @@ def _build_section(home: Path) -> str:
     roster_lines = [_bullet(f"@{_handle(name)}", _profile_role(d)) for name, d in _roster(root) if name != me]
     roster_block = "\n".join(roster_lines) or "- (no teammates yet)"
 
+    delivery_guidance = (
+        "Dispatch all ready independent assignments before finishing your turn. "
+        "Do not wait or poll. Review each automatic return, request corrections "
+        "when needed, and start work whose dependencies are now satisfied. "
+        if manager else
+        "Send it, finish your turn, and the reply arrives later as a "
+        "background-process completion notification that wakes you; relay it "
+        "to the user then, attributed to that agent. "
+    )
+    delegation_guidance = (
+        "For substantial work, use message_agent(assignments=[{target, message}, ...]) "
+        "to dispatch ready independent tasks together to existing specialists. "
+        "Answer small questions directly. Give each assignment a self-contained "
+        "objective, inputs, permitted actions, separate output ownership, and "
+        "acceptance evidence. Delegate within the user's authorized scope; "
+        "serialize dependencies and conflicting writes, not independent work. "
+        "Dispatch acknowledgements are not completion. Partial failures do not "
+        "undo successful sends: never resend the entire batch. Worker final "
+        "responses return automatically; do not ask for reciprocal DMs.\n"
+        if manager else
+        "Message ONE clearly relevant teammate; don't fan out to several unless "
+        "the user explicitly asked.\n"
+    )
+
+    reply_guidance = (
+        "Reply with your normal final response; the delivery mechanism returns "
+        "it automatically. Do not send a reciprocal acknowledgement.\n"
+        if manager else
+        "address them, reply concisely via message_agent to their handle, and "
+        "if it is a pure FYI with nothing to add, staying silent is fine — never "
+        "ping-pong acknowledgements.\n"
+    )
+
     return (
         f"{_PROTOCOL_HEADING}\n"
         "This install runs Bot Mode: each Hermes profile is an agent teammate with "
         'one canonical "Bot Chat" conversation, and you have the `message_agent` '
         "tool to DM any of them. It is FIRE-AND-FORGET: it delivers your message "
         "with your attribution prefixed automatically and returns an acknowledgement "
-        "immediately — it never returns the reply. Send it, finish your turn, and "
-        "the reply arrives later as a background-process completion notification "
-        "that wakes you; relay it to the user then, attributed to that agent. "
+        "immediately — it never returns the reply. "
+        f"{delivery_guidance}"
         "COMPOSE every message yourself — say what YOU need from that agent; never "
         "forward the user's words verbatim, and never reveal private 1:1 chat "
         "content. When the user says \"ask <name>\" or \"tell <name> ...\", that is "
         "a handoff: pick the right teammate from the roster below, message them "
-        "with message_agent, and report back naming which agent replied. Message "
-        "ONE clearly relevant teammate; don't fan out to several unless the user "
-        "explicitly asked.\n"
+        "with message_agent, and report back naming which agent replied. "
+        f"{delegation_guidance}"
         f'When YOU receive a "Message from 🤖 <name> (@<handle>):" message, a '
-        "teammate agent is talking to you (not the user): address them, reply "
-        "concisely via message_agent to their handle, and if it is a pure FYI "
-        "with nothing to add, staying silent is fine — never ping-pong "
-        "acknowledgements.\n"
+        "teammate agent is talking to you (not the user): "
+        f"{reply_guidance}"
         f"You are `@{_handle(me)}`. Your teammates (live roster; roles from their "
         "profiles):\n"
         f"{roster_block}"
@@ -228,15 +257,16 @@ def _build_section(home: Path) -> str:
     )
 
 
-def get_bot_mode_protocol_section(home: str | os.PathLike | None = None, *, force_refresh: bool = False) -> str:
+def get_bot_mode_protocol_section(home: str | os.PathLike | None = None, *, force_refresh: bool = False, manager: bool = False) -> str:
     """Cached probe entry point — one filesystem pass per (process, home). ``home`` should be
     the AGENT'S OWN resolved home (session-db derived), not ambient HERMES_HOME — build threads
     can lose the ContextVar override and the env var would then name the wrong profile."""
     resolved = str(_resolve_home(home))
+    key = (resolved, manager)
     with _lock:
-        if force_refresh or resolved not in _cached:
-            _cached[resolved] = _swallow(lambda: _build_section(Path(resolved)), "")
-        return _cached[resolved]
+        if force_refresh or key not in _cached:
+            _cached[key] = _swallow(lambda: _build_section(Path(resolved), manager=manager), "")
+        return _cached[key]
 
 
 # ── capability epoch ─────────────────────────────────────────────────────────
@@ -273,6 +303,9 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
             reset_hermes_home_override(token)
         skills_cfg = cfg.get("skills") if isinstance(cfg.get("skills"), dict) else {}
         tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
+        agent_cfg = cfg.get("agent")
+        if isinstance(agent_cfg, dict) and agent_cfg.get("bot_mode_manager", False) is True:
+            surface["bot_mode_manager"] = True
         surface["disabled_skills"] = sorted(str(s).lower() for s in (skills_cfg.get("disabled") or []))
         surface["enabled_toolsets"] = sorted(str(t) for t in (tools_cfg.get("enabled_toolsets") or []))
         mcp = cfg.get("mcp_servers")

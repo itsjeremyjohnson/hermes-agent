@@ -120,6 +120,36 @@ agent:
 Bot-to-bot delivery is per-invocation: the receiving Bot picks the message up when it next runs. Live interrupt of a Bot mid-conversation is future work.
 :::
 
+### Manager delegation (opt-in)
+
+For a Bot that coordinates existing specialists, set this in that profile's `config.yaml`:
+
+```yaml
+agent:
+  bot_mode_manager: true
+```
+
+The default is `false`. Manager mode adds batch dispatch to the existing `message_agent` tool in canonical **Bot Chat**. It also teaches the manager to answer small questions directly, dispatch independent specialist work before ending its turn, and review automatic returns. It does not change group-room scheduling, create specialists, or grant additional permissions.
+
+A manager can send one `target`/`message` pair as before, or submit up to eight independent assignments:
+
+```json
+{
+  "assignments": [
+    {"target": "researcher", "message": "Review the supplied sources. Return findings and supporting evidence. Read-only."},
+    {"target": "coder", "message": "Review the supplied implementation. Return defects and supporting evidence. Read-only."}
+  ]
+}
+```
+
+Use existing roster targets, including `handle@connection` or `peer/agent` where appropriate. Each assignment starts through the existing background delivery path. Different recipients can work concurrently; deliveries to the same recipient retain their existing turn lock. Dependencies and conflicting writes should be assigned in separate steps.
+
+The batch returns indexed dispatch results, **not completed work**. Malformed batches dispatch nothing. A routing or startup failure for one valid entry does not prevent other entries from being attempted. Successful entries remain dispatched if another entry fails; do not resend the whole batch. An unknown acknowledgement requires checking the recipient before retrying. Worker finals return through the existing completion notifications for the manager to review.
+
+Configuration is captured when an agent is initialized. Existing agent objects retain their setting and tool schema; newly initialized Bot Chat agents use the existing capability-epoch check to refresh stored protocol after a setting change. No conversation history is reset. Keep `agent.bot_mode_protocol` enabled to expose teammate messaging.
+
+Manager mode makes batch dispatch available; it does not guarantee that a model will choose a useful decomposition. Verify actual worker start/finish times and reviewed returns on a representative task before rolling it out to other managers.
+
 ### Failed turns retry safely
 
 Local one-shot delivery preserves the active-session refusal code separately from

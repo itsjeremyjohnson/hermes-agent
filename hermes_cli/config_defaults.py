@@ -154,6 +154,8 @@ DEFAULT_CONFIG = {
         "environment_probe": True,
         # Bot Mode teammate-messaging protocol section (silent unless desktop Bot Mode manages it).
         "bot_mode_protocol": True,
+        # Opt-in batching and delegation guidance for canonical Bot Chat managers.
+        "bot_mode_manager": False,
         # Embedder-supplied text appended to the system prompt's environment-hints block, so a host
         # wrapping Hermes (sandbox runner, managed platform) can describe proxy/credential/ mount
         # layout without editing SOUL.md. Env HERMES_ENVIRONMENT_HINT overrides it.
