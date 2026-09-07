@@ -204,7 +204,9 @@ def _reinject_authorized_dynamic_tools(agent, tools_list: list, name_set: set) -
     tools_list[:] = [entry for entry in tools_list if _def_name(entry) != MESSAGE_AGENT_TOOL_NAME]
     name_set.discard(MESSAGE_AGENT_TOOL_NAME)
     if message_agent_authorized(agent):
-        tools_list.append(message_agent_tool_schema())
+        tools_list.append(message_agent_tool_schema(
+            manager=getattr(agent, "_bot_mode_manager", False) is True
+        ))
         name_set.add(MESSAGE_AGENT_TOOL_NAME)
 
 

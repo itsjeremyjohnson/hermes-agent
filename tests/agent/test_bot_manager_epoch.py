@@ -13,6 +13,7 @@ from hermes_state import SessionDB
 from tests.tools.test_bot_mode_dm import _managed_home
 from tools import bot_mode_probe
 from tools.bot_mode_dm import ensure_message_agent_tool
+from tools.mcp_tool_agent import persist_agent_tool_names
 
 
 @pytest.mark.parametrize('before', [False, True])
@@ -52,11 +53,14 @@ def test_manager_epoch_uses_agent_snapshot_across_persisted_restore(tmp_path, mo
         old = new_agent()
         old._cached_system_prompt = old._build_system_prompt('')
         original = old._cached_system_prompt
+        persist_agent_tool_names(old)
         configure(not before)
-        # Exclude unrelated MCP discovery; retain real prompt, epoch, DB and restore paths.
-        monkeypatch.setattr('agent.conversation_compression._refresh_agent_tool_definitions', lambda _: None)
+        # Exclude unrelated tool discovery; retain actual refresh/reinjection and persistence.
+        monkeypatch.setattr('model_tools.get_tool_definitions', lambda **_: [])
         rebuilt = _rebuild_system_prompt_at_boundary(old, '')
         assert rebuilt == original
+        assert ('assignments' in old.tools[0]['function']['parameters']['properties']) is before
+        assert db.get_session(sid)['tool_names'] is not None
         _persist_system_prompt(old, 'persist failed: %s %s')
         fresh = new_agent()
         _restore_or_build_system_prompt(fresh, '', history)
@@ -70,6 +74,8 @@ def test_manager_epoch_uses_agent_snapshot_across_persisted_restore(tmp_path, mo
         _restore_or_build_system_prompt(continued, '', history)
         assert continued.build_count == 0
         assert continued._cached_system_prompt == fresh._cached_system_prompt
+        assert continued.tools == fresh.tools
+        assert continued.valid_tool_names == fresh.valid_tool_names
         assert history == [{'role': 'user', 'content': 'existing history'}]
         assert db.get_session_title(sid) == 'Bot Chat'
     finally:
