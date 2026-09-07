@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 MAX_ASSIGNMENTS = 8
 
@@ -72,9 +75,11 @@ def dispatch_batch(assignments: Any, *, mixed_form: bool,
             result = json.loads(message_agent_tool(**assignment, task_id=task_id, agent=agent))
             if not isinstance(result, dict):
                 raise ValueError("Delivery returned a non-object acknowledgement")
-        except Exception:
+        except Exception as exc:
             # Earlier entries may already be running. Keep their receipts and
             # mark this entry ambiguous; never automatically resend it.
+            # Exception text can contain private payloads from an adapter.
+            logger.warning("Batch acknowledgement unavailable at index %s (%s)", index, type(exc).__name__)
             result = {"status": "unknown", "error": "Dispatch acknowledgement unavailable; check recipient before retrying."}
         results.append({"index": index, "target": assignment["target"], "result": result})
     sent = sum(entry["result"].get("status") == "sent" for entry in results)

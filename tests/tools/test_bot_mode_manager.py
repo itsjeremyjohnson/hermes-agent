@@ -154,7 +154,7 @@ print(name + ' completed')
         bot_mode_probe._reset_cache_for_tests()
 
 
-def test_batch_containment_and_failure_continuation(tmp_path, monkeypatch):
+def test_batch_containment_and_failure_continuation(tmp_path, monkeypatch, caplog):
     from hermes_state import SessionDB
 
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
@@ -208,11 +208,13 @@ def test_batch_containment_and_failure_continuation(tmp_path, monkeypatch):
             target = kwargs['target']
             attempted.append(target)
             if len(attempted) == 1:
-                raise RuntimeError('acknowledgement lost')
+                raise RuntimeError('private assignment content')
             return json.dumps({'status': 'sent'})
         monkeypatch.setattr(bot_mode_dm, 'message_agent_tool', uncertain_delivery)
         result = json.loads(call(manager, {'assignments': assignments[:2]}, ctx))
         assert attempted == ['researcher', 'coder']
+        assert 'Batch acknowledgement unavailable at index 0 (RuntimeError)' in caplog.text
+        assert 'private assignment content' not in caplog.text
         assert result['results'][0]['result']['status'] == 'unknown'
         assert result['results'][1]['result']['status'] == 'sent'
     finally:
