@@ -3,7 +3,6 @@ import json
 import os
 from pathlib import Path
 import shlex
-import subprocess
 import sys
 import time
 
@@ -106,37 +105,118 @@ while not (root / 'release').exists():
 print(name + ' completed')
 ''')
     worker.chmod(0o755)
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('SHELL', '/bin/bash')
+    # Recreate the installed CLI/import environment inside this isolated shell home.
+    (tmp_path / '.bash_profile').write_text(
+        f'export PATH={shlex.quote(str(bin_dir))}:$PATH\n'
+        f'export PYTHONPATH={shlex.quote(str(Path.cwd()))}\n'
+    )
     monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
     monkeypatch.setenv('BATCH_TEST_DIR', str(tmp_path))
     monkeypatch.setenv('PYTHONPATH', str(Path.cwd()))
+    from tools.process_registry import ProcessRegistry
+    registry = ProcessRegistry()
+    monkeypatch.setattr('tools.process_registry.process_registry', registry)
+    monkeypatch.setenv('HERMES_SESSION_KEY', 'manager-overlap')
     processes = []
-    def spawn(command, **kwargs):
-        assert kwargs['background'] and kwargs['notify_on_complete'] and kwargs['_host_local']
-        process = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        processes.append(process)
-        return json.dumps({'session_id': f'proc-{process.pid}'})
-    monkeypatch.setattr('tools.terminal_tool.terminal_tool', spawn)
     try:
         result = json.loads(INLINE_TOOL_EXECUTORS['message_agent'](agent, {'assignments': [
             {'target': 'researcher', 'message': 'research payload'},
             {'target': 'coder', 'message': 'code payload'}
         ]}, InlineToolContext(effective_task_id='overlap-test')))
-        assert result['sent'] == 2
+        assert result['sent'] == 2, result
+        processes = [registry.get(entry['result']['process_id']) for entry in result['results']]
         deadline = time.monotonic() + 15
         while not all((tmp_path / f'{name}.started').exists() for name in ('researcher', 'coder')):
-            assert time.monotonic() < deadline, 'Both workers must start before release'
+            assert time.monotonic() < deadline, [p.output_buffer for p in processes]
             time.sleep(0.02)
-        assert all(p.poll() is None for p in processes)
+        assert all(p is not None and p.notify_on_complete and not p.exited for p in processes)
         assert 'research payload' in (tmp_path / 'researcher.started').read_text()
         assert 'code payload' in (tmp_path / 'coder.started').read_text()
         (tmp_path / 'release').touch()
-        for process in processes:
-            output, error = process.communicate(timeout=10)
-            assert process.returncode == 0, error
-            assert 'completed' in output
+        deadline = time.monotonic() + 10
+        while registry.completion_queue.qsize() < 2:
+            assert time.monotonic() < deadline, 'Both workers must produce completion notifications'
+            time.sleep(0.02)
+        assert registry.drain_notifications('other-manager') == []
+        notifications = registry.drain_notifications('manager-overlap')
+        assert len(notifications) == 2
+        assert {event['session_id'] for event, _ in notifications} == {p.id for p in processes}
+        text = '\n'.join(text for _, text in notifications)
+        assert 'researcher completed' in text and 'coder completed' in text
+        assert registry.drain_notifications('manager-overlap') == []
     finally:
         (tmp_path / 'release').touch()
         for process in processes:
-            if process.poll() is None:
-                process.communicate(timeout=10)
+            if not process.exited:
+                registry.kill_process(process.id)
+        bot_mode_probe._reset_cache_for_tests()
+
+
+def test_batch_containment_and_failure_continuation(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    home = _managed_home(tmp_path, teammates=('researcher', 'coder'))
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    bot_mode_probe._reset_cache_for_tests()
+    db = SessionDB(home / 'state.db')
+    manager = _FakeAgent(home)
+    manager._session_db = db
+    manager._bot_mode_manager = True
+    db.create_session(manager.session_id, source='cli')
+    call = INLINE_TOOL_EXECUTORS['message_agent']
+    ctx = InlineToolContext(effective_task_id='failure-test')
+    valid = {'target': 'researcher', 'message': 'review'}
+    launched = []
+
+    def spawn(command, **kwargs):
+        launched.append(command)
+        # Fail the middle admission; the last must still be attempted exactly once.
+        if len(launched) == 2:
+            return json.dumps({'error': 'test startup failure'})
+        return json.dumps({'session_id': f'proc-{len(launched)}'})
+
+    monkeypatch.setattr('tools.terminal_tool.terminal_tool', spawn)
+    try:
+        for title in ('Group: Team', 'ordinary chat'):
+            db.set_session_title(manager.session_id, title)
+            assert 'error' in json.loads(call(manager, {'assignments': [valid]}, ctx))
+        db.set_session_title(manager.session_id, 'Bot Chat')
+        for bad in (None, 'wrong', {}, {'target': 1, 'message': 'x'},
+                    {'target': 'coder', 'message': ' '},
+                    {'target': 'coder', 'message': 'x' * (bot_mode_dm.MESSAGE_MAX_CHARS + 1)},
+                    {**valid, 'extra': True}):
+            assert 'error' in json.loads(call(manager, {'assignments': [valid, bad]}, ctx))
+        assert not launched
+        assignments = [valid, {'target': 'coder', 'message': 'review'}, valid]
+        result = json.loads(call(manager, {'assignments': assignments}, ctx))
+        assert result['status'] == 'partial' and result['sent'] == 2
+        assert [entry['index'] for entry in result['results']] == [0, 1, 2]
+        assert [entry['target'] for entry in result['results']] == ['researcher', 'coder', 'researcher']
+        assert 'failed to start' in result['results'][1]['result']['error']
+        assert len(launched) == 3
+
+        # An adapter can fail after side effects; preserve ambiguity and continue,
+        # without retrying either the uncertain or successful entry.
+        attempted = []
+        real_delivery = bot_mode_dm.message_agent_tool
+        def uncertain_delivery(**kwargs):
+            if 'assignments' in kwargs:
+                return real_delivery(**kwargs)
+            target = kwargs['target']
+            attempted.append(target)
+            if len(attempted) == 1:
+                raise RuntimeError('acknowledgement lost')
+            return json.dumps({'status': 'sent'})
+        monkeypatch.setattr(bot_mode_dm, 'message_agent_tool', uncertain_delivery)
+        result = json.loads(call(manager, {'assignments': assignments[:2]}, ctx))
+        assert attempted == ['researcher', 'coder']
+        assert result['results'][0]['result']['status'] == 'unknown'
+        assert result['results'][1]['result']['status'] == 'sent'
+    finally:
+        for command in launched:
+            Path(shlex.split(command)[4]).unlink(missing_ok=True)
+        db.close()
         bot_mode_probe._reset_cache_for_tests()

@@ -146,7 +146,7 @@ Use existing roster targets, including `handle@connection` or `peer/agent` where
 
 The batch returns indexed dispatch results, **not completed work**. Malformed batches dispatch nothing. A routing or startup failure for one valid entry does not prevent other entries from being attempted. Successful entries remain dispatched if another entry fails; do not resend the whole batch. An unknown acknowledgement requires checking the recipient before retrying. Worker finals return through the existing completion notifications for the manager to review.
 
-Configuration is captured when an agent is initialized. Existing agent objects retain their setting and tool schema; newly initialized Bot Chat agents use the existing capability-epoch check to refresh stored protocol after a setting change. No conversation history is reset. Keep `agent.bot_mode_protocol` enabled to expose teammate messaging.
+Configuration is captured when an agent is initialized. Existing agent objects retain their setting and tool schema; newly initialized Bot Chat agents use the existing capability-epoch check to refresh stored protocol after a setting change. Compaction keeps the running agent’s captured mode in both its instructions and saved epoch, so the next initialized agent refreshes exactly once when its mode differs. No conversation history is reset. Keep `agent.bot_mode_protocol` enabled to expose teammate messaging.
 
 Manager mode makes batch dispatch available; it does not guarantee that a model will choose a useful decomposition. Verify actual worker start/finish times and reviewed returns on a representative task before rolling it out to other managers.
 

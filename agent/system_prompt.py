@@ -330,7 +330,9 @@ def _bot_mode_parts(agent: Any) -> List[str]:
             parts.append(_bot_section)
             # Capability epoch lets the restore path rebuild ONCE per
             # user-initiated capability change in an eternal session.
-            parts.append(epoch_line(_agent_home(agent)))
+            parts.append(epoch_line(
+                _agent_home(agent), manager=getattr(agent, "_bot_mode_manager", False) is True
+            ))
             agent._bot_chat_timeless_prompt = True
     except Exception:
         pass

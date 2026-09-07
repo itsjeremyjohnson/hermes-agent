@@ -608,7 +608,9 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str) -> bool:
             home = _agent_home(agent)
         except Exception:
             pass
-        if stored_prompt_capability_stale(stored_prompt, home):
+        if stored_prompt_capability_stale(
+            stored_prompt, home, manager=getattr(agent, "_bot_mode_manager", False) is True
+        ):
             return True
         if not getattr(agent, "_bot_mode_protocol", True):
             return False

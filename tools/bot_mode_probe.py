@@ -280,11 +280,12 @@ _EPOCH_PREFIX = "Capability epoch: "
 _EPOCH_RE_TEXT = r"Capability epoch: ([0-9a-f]{12})"
 
 
-def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
+def capability_fingerprint(home: str | os.PathLike | None = None, *, manager: bool | None = None) -> str:
     """12-hex digest of the capability surface for ``home``'s profile: disabled skills +
     enabled toolsets + MCP config, SOUL.md bytes, installed skill names, the Bot-Mode roster
     (+ roles), peers and the relay roster. Deliberately NOT cached — the point is detecting
-    on-disk drift against a stored prompt's epoch. Never raises ("unavailable" on failure)."""
+    on-disk drift against a stored prompt's epoch. ``manager`` pins that setting to
+    the agent snapshot when supplied, keeping the epoch aligned with its protocol. Never raises ("unavailable" on failure)."""
     import hashlib
     import json
 
@@ -305,14 +306,19 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
         skills_cfg = cfg.get("skills") if isinstance(cfg.get("skills"), dict) else {}
         tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
         agent_cfg = cfg.get("agent")
-        if isinstance(agent_cfg, dict) and agent_cfg.get("bot_mode_manager", False) is True:
-            surface["bot_mode_manager"] = True
+        if manager is None:
+            manager = isinstance(agent_cfg, dict) and agent_cfg.get("bot_mode_manager", False) is True
         surface["disabled_skills"] = sorted(str(s).lower() for s in (skills_cfg.get("disabled") or []))
         surface["enabled_toolsets"] = sorted(str(t) for t in (tools_cfg.get("enabled_toolsets") or []))
         mcp = cfg.get("mcp_servers")
         surface["mcp"] = json.dumps(mcp, sort_keys=True, default=str) if isinstance(mcp, dict) else ""
     except Exception:
         pass
+
+    # Even if config loading fails, preserve an explicit agent snapshot. False
+    # stays absent for compatibility with ordinary pre-manager fingerprints.
+    if manager is True:
+        surface["bot_mode_manager"] = True
 
     def _soul() -> str:
         soul = resolved / "SOUL.md"
@@ -349,21 +355,23 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     )
 
 
-def epoch_line(home: str | os.PathLike | None = None) -> str:
+def epoch_line(home: str | os.PathLike | None = None, *, manager: bool | None = None) -> str:
     """The epoch stamp appended to a Bot Chat prompt."""
-    return f"{_EPOCH_PREFIX}{capability_fingerprint(home)}"
+    return f"{_EPOCH_PREFIX}{capability_fingerprint(home, manager=manager)}"
 
 
-def stored_prompt_capability_stale(stored_prompt: str, home: str | os.PathLike | None = None) -> bool:
+def stored_prompt_capability_stale(
+    stored_prompt: str, home: str | os.PathLike | None = None, *, manager: bool | None = None
+) -> bool:
     """True when ``stored_prompt`` is a Bot Chat prompt whose embedded epoch no
-    longer matches disk. Unstamped prompts are never stale. Fails closed to
+    longer matches disk (with the supplied manager snapshot). Unstamped prompts are never stale. Fails closed to
     "not stale" — a broken probe must not become a rebuild-every-turn cache burner."""
     import re
 
     m = re.search(_EPOCH_RE_TEXT, stored_prompt or "")
     if not m:
         return False
-    current = _swallow(lambda: capability_fingerprint(home), "unavailable")
+    current = _swallow(lambda: capability_fingerprint(home, manager=manager), "unavailable")
     return current != "unavailable" and m.group(1) != current
 
 

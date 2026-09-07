@@ -9,7 +9,7 @@ Implement an opt-in backend manager mode for existing canonical Bot Chats. The u
 - Extend the existing injected `message_agent` tool with an `assignments` batch containing target/message pairs. Keep single target/message calls backward compatible. Batches are manager-only and canonical-Bot-Chat-only.
 - Bound each batch to eight assignments. Reject malformed batches and mixed single/batch input before dispatching anything. Validate routes with the existing local, peer, and Desktop-relay paths. Return separate indexed results for routing/start failures without blocking other valid entries. Never retry the entire batch or duplicate successful sends.
 - Reuse background delivery, automatic completion notifications, sender identity, per-recipient turn locks, and canonical conversation identity. Do not add another worker scheduler. Different recipients must be able to overlap; one recipient retains its existing serialization.
-- Keep the setting fixed on an existing agent object. Use the established Bot Chat capability epoch when a new agent loads changed config; do not rewrite history or add per-turn prompt changes.
+- Keep the setting fixed on an existing agent object. Use the established Bot Chat capability epoch when a new agent loads changed config; do not rewrite history or add per-turn prompt changes. Both prompt stamps and restore comparisons must use the initialized agent’s captured manager mode, including across compaction and config edits after initialization.
 - No desktop/group routing changes, new agent profiles, infrastructure changes, or live tasks in this implementation.
 
 ## Verification
