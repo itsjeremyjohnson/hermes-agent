@@ -41,7 +41,7 @@ def configure_manager_schema(schema: dict) -> None:
     }
 
 
-def dispatch_batch(assignments: list | None, *, mixed_form: bool,
+def dispatch_batch(assignments: Any, *, mixed_form: bool,
                    task_id: str | None, agent: Any) -> str:
     from tools.bot_mode_dm import MESSAGE_MAX_CHARS, message_agent_authorized, message_agent_tool
 
