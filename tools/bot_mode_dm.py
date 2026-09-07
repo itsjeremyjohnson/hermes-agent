@@ -35,6 +35,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 MESSAGE_AGENT_TOOL_NAME = "message_agent"
+_OMITTED: Any = object()
 
 # Message body cap — generous for real work, small enough that a runaway paste can't
 # turn one DM into a context bomb on the recipient.
@@ -176,13 +177,16 @@ def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | No
     return json.dumps(payload)
 
 
-def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None,
-                       assignments: Optional[list] = None) -> str:
+def message_agent_tool(target: str = _OMITTED, message: str = _OMITTED, task_id: Optional[str] = None, agent: Any = None,
+                       assignments: Optional[list] = _OMITTED) -> str:
     """Deliver ``message`` to ``target``'s Bot Chat. Returns a JSON ack/error.
     ``agent`` is the calling AIAgent — used for the Bot Chat gate and sender identity."""
-    if assignments is not None:
+    if assignments is not _OMITTED:
         from tools.bot_mode_batch import dispatch_batch
-        return dispatch_batch(assignments, target=target, message=message, task_id=task_id, agent=agent)
+        return dispatch_batch(assignments, mixed_form=target is not _OMITTED or message is not _OMITTED,
+                              task_id=task_id, agent=agent)
+    target = "" if target is _OMITTED else target
+    message = "" if message is _OMITTED else message
     home = _agent_home(agent)
     try:
         from tools.bot_mode_probe import (

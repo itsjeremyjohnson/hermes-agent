@@ -5,7 +5,7 @@ a bot's canonical "Bot Chat" session — ONLY that session (agent/system_prompt.
 the ``BOT_CHAT_TITLE`` gate) — gets a "Messaging other agents" section. Silent (``""``)
 when no profile is managed or on any error. Older desktop builds appended a frozen copy of
 the section to SOUL.md; ``strip_legacy_protocol`` drops it at load time so the live roster
-here is the only copy any session sees. Cached per (process, home) so compression rebuilds
+here is the only copy any session sees. Cached per (process, home, manager mode) so compression rebuilds
 produce identical bytes. Toggle: ``agent.bot_mode_protocol``. Also hosts path/roster
 helpers shared by ``bot_mode_dm`` and ``bot_relay``.
 """
@@ -258,7 +258,8 @@ def _build_section(home: Path, *, manager: bool = False) -> str:
 
 
 def get_bot_mode_protocol_section(home: str | os.PathLike | None = None, *, force_refresh: bool = False, manager: bool = False) -> str:
-    """Cached probe entry point — one filesystem pass per (process, home). ``home`` should be
+    """Cached per (process, home, manager mode); ``force_refresh`` bypasses the cache.
+    ``home`` should be
     the AGENT'S OWN resolved home (session-db derived), not ambient HERMES_HOME — build threads
     can lose the ContextVar override and the env var would then name the wrong profile."""
     resolved = str(_resolve_home(home))

@@ -62,7 +62,9 @@ def test_manager_config_schema_protocol_and_batch_containment(tmp_path, monkeypa
     group_agent._bot_mode_manager = True
     for candidate in (agent, group_agent):
         assert 'error' in json.loads(call(candidate, {'assignments': [assignment]}, ctx))
-    for args in ({'assignments': []}, {'assignments': [assignment] * 9},
+    for args in ({'assignments': None}, {'assignments': None, 'target': 'researcher', 'message': 'no'},
+                 {'assignments': [assignment], 'target': '', 'message': ''},
+                 {'assignments': []}, {'assignments': [assignment] * 9},
                  {'assignments': [assignment, {'target': 'coder'}]},
                  {'assignments': [assignment], 'target': 'coder', 'message': 'mixed'}):
         assert 'error' in json.loads(call(manager, args, ctx))

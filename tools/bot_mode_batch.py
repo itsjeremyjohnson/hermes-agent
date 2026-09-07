@@ -41,24 +41,27 @@ def configure_manager_schema(schema: dict) -> None:
     }
 
 
-def dispatch_batch(assignments: list, *, target: str, message: str,
+def dispatch_batch(assignments: list | None, *, mixed_form: bool,
                    task_id: str | None, agent: Any) -> str:
     from tools.bot_mode_dm import MESSAGE_MAX_CHARS, message_agent_authorized, message_agent_tool
 
     if not message_agent_authorized(agent) or getattr(agent, "_bot_mode_manager", False) is not True:
         return json.dumps({"error": "Batch dispatch requires an enabled manager in a managed Bot Chat."})
-    if target or message:
+    if mixed_form:
         return json.dumps({"error": "Use assignments or target/message, not both. No assignments dispatched."})
     if not isinstance(assignments, list) or not 1 <= len(assignments) <= MAX_ASSIGNMENTS:
         return json.dumps({"error": f"Provide 1–{MAX_ASSIGNMENTS} assignments. No assignments dispatched."})
     # Reject malformed payloads before any side effects. Routing errors remain
     # per-recipient outcomes, so one unavailable specialist cannot block the others.
     for index, assignment in enumerate(assignments):
-        if (not isinstance(assignment, dict) or set(assignment) != {"target", "message"}
-                or any(not isinstance(assignment[key], str) or not assignment[key].strip()
-                       for key in ("target", "message"))
-                or len(assignment["message"].strip()) > MESSAGE_MAX_CHARS):
-            return json.dumps({"error": f"Invalid assignment at index {index}. No assignments dispatched."})
+        invalid = {"error": f"Invalid assignment at index {index}. No assignments dispatched."}
+        if not isinstance(assignment, dict) or set(assignment) != {"target", "message"}:
+            return json.dumps(invalid)
+        if any(not isinstance(assignment[key], str) or not assignment[key].strip()
+               for key in ("target", "message")):
+            return json.dumps(invalid)
+        if len(assignment["message"].strip()) > MESSAGE_MAX_CHARS:
+            return json.dumps(invalid)
 
     results = []
     for index, assignment in enumerate(assignments):
@@ -75,8 +78,14 @@ def dispatch_batch(assignments: list, *, target: str, message: str,
             result = {"status": "unknown", "error": "Dispatch acknowledgement unavailable; check recipient before retrying."}
         results.append({"index": index, "target": assignment["target"], "result": result})
     sent = sum(entry["result"].get("status") == "sent" for entry in results)
+    if sent == len(results):
+        status = "sent"
+    elif sent:
+        status = "partial"
+    else:
+        status = "failed"
     return json.dumps({
-        "status": "sent" if sent == len(results) else "partial" if sent else "failed",
+        "status": status,
         "sent": sent,
         "results": results,
         "detail": "Dispatch complete, not worker completion. Review automatic returns. Do not resend successful or ambiguous entries.",

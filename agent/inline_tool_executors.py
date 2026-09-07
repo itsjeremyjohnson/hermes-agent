@@ -149,6 +149,14 @@ def _desktop_preview(agent, args: dict, ctx: InlineToolContext) -> Any:
     return _handle_preview(args)
 
 
+def _message_agent(agent, args: dict, ctx: InlineToolContext) -> Any:
+    from tools.bot_mode_dm import message_agent_tool
+
+    # Presence matters: explicit null/empty batch fields are not an omitted batch.
+    supplied = {key: args[key] for key in ("target", "message", "assignments") if key in args}
+    return message_agent_tool(**supplied, task_id=ctx.effective_task_id, agent=agent)
+
+
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
 INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
     "todo_list": _tool(
@@ -157,11 +165,7 @@ INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
     ),
     # Bot Mode teammate DM is injected, not registered: only a canonical Bot
     # Chat session carries the schema, and the tool re-gates on the title.
-    "message_agent": _tool(
-        "tools.bot_mode_dm", "message_agent_tool", ("target", "target", ""), ("message", "message", ""),
-        ("assignments", "assignments"),
-        task_id=lambda agent, ctx: ctx.effective_task_id, agent=lambda agent, ctx: agent,
-    ),
+    "message_agent": _message_agent,
     "session_search": _session_search,
     "memory": _memory,
     "clarify": _tool(
