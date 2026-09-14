@@ -1010,6 +1010,22 @@ def _resolve_review_provider() -> tuple:
     return rp, model_name, provider, overrides
 
 
+def _resolve_review_fallback_chain() -> list[dict]:
+    """Use the curator task chain, then the profile's main fallback policy."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        cfg = load_config_readonly() or {}
+        task_chain = _subdict(cfg, "auxiliary", "curator").get("fallback_chain")
+        if isinstance(task_chain, list):
+            return [dict(entry) for entry in task_chain if isinstance(entry, dict)]
+        return get_fallback_chain(cfg)
+    except Exception as exc:
+        logger.debug("Curator fallback resolution failed: %s", exc, exc_info=True)
+        return []
+
+
 def _run_llm_review(prompt: str) -> Dict[str, Any]:
     """Spawn an AIAgent fork on the review prompt. Returns ``final`` (untruncated response), ``summary`` (240-char cap),
     ``model``/``provider`` (what ran), ``tool_calls`` ([{name, arguments}], truncated) and ``error``. Never raises."""
@@ -1020,6 +1036,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         result_meta["error"] = result_meta["summary"] = f"AIAgent import failed: {e}"
         return result_meta
     rp, model_name, provider, request_overrides = _resolve_review_provider()
+    fallback_chain = _resolve_review_fallback_chain()
     result_meta["model"], result_meta["provider"] = model_name, provider or ""
     review_agent = None
     try:
@@ -1030,7 +1047,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         review_agent = AIAgent(
             model=model_name, provider=provider, api_key=rp.get("api_key"), base_url=rp.get("base_url"),
             api_mode=rp.get("api_mode"), credential_pool=rp.get("credential_pool"),
-            request_overrides=request_overrides, **agent_kwargs,
+            request_overrides=request_overrides, fallback_model=fallback_chain, **agent_kwargs,
             # No ``terminal``: a shell mv/cp/rm under the skills tree writes bytes
             # with NO ledger entry, so rollback would restore a hollow skill. Every
             # mutation goes through ledgered skill_manage; dropping the toolset
@@ -1052,6 +1069,11 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
              contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
             conv_result = review_agent.run_conversation(user_message=prompt)
         final = str(conv_result.get("final_response") or "").strip() if isinstance(conv_result, dict) else ""
+        result_meta["model"] = str(
+            (conv_result.get("model") if isinstance(conv_result, dict) else None)
+            or getattr(review_agent, "model", None) or model_name
+        )
+        result_meta["provider"] = str(getattr(review_agent, "provider", None) or provider or "")
         result_meta["final"] = final
         result_meta["summary"] = (final[:240] + "…") if len(final) > 240 else (final or "no change")
         # Tool calls for the report; arguments truncated to 400 chars so a giant skill_manage create doesn't blow it up.

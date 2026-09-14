@@ -796,6 +796,56 @@ def test_review_fork_forwards_runtime_pool_and_overrides(curator_env, monkeypatc
     assert captured["kwargs"]["request_overrides"] == fake_overrides
 
 
+def test_review_fork_forwards_task_fallback_and_reports_activated_model(curator_env, monkeypatch):
+    curator = curator_env["curator"]
+    import importlib
+    importlib.reload(curator)
+    captured = {}
+    fallback = {
+        "provider": "custom", "model": "zai-coding/glm-5.3-flash",
+        "base_url": "http://proxy.test/v1", "api_mode": "chat_completions",
+        "key_env": "TEST_PROXY_KEY",
+    }
+    cfg = {
+        "model": {"provider": "custom", "default": "grok-4.6"},
+        "auxiliary": {"curator": {
+            "provider": "custom", "model": "grok-4.6",
+            "fallback_chain": [fallback],
+        }},
+        "fallback_providers": [{"provider": "custom", "model": "wrong-global"}],
+    }
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "custom", "api_key": "test-key",
+            "base_url": "http://proxy.test/v1", "api_mode": "chat_completions",
+        },
+    )
+
+    class _StubAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.model = "grok-4.6"
+            self.provider = "custom"
+            self._session_messages = []
+
+        def run_conversation(self, **_kwargs):
+            self.model = "zai-coding/glm-5.3-flash"
+            return {"completed": True, "final_response": "ok", "model": self.model}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("run_agent.AIAgent", _StubAgent)
+    result = curator._run_llm_review("review")
+
+    assert captured["fallback_model"] == [fallback]
+    assert result["model"] == "zai-coding/glm-5.3-flash"
+    assert result["provider"] == "custom"
+
+
 def test_review_fork_uses_runtime_model_and_output_cap(curator_env, monkeypatch):
     curator = curator_env["curator"]
     import importlib
