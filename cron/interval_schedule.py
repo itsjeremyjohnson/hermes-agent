@@ -116,9 +116,16 @@ def preserve_manual_update(job, updated, updates):
         "paused_at" in updates or updates.get("state") == "paused" or updates.get("enabled") is False)
     if (anchored or "manual_next_run_at" in updated) and (edited or lifecycle):
         claim = updated.get("fire_claim")
-        if ("manual_next_run_at" in job or error_policy.selected(old_schedule)) and isinstance(claim, dict):
-            # Keep execution identity/outcome ownership while transferring cadence
-            # to this operator edit, including a later edit back to the old value.
+        # Manual and error-policy runs already own their slot. A normal anchored
+        # fire has neither, but an operator schedule edit during that claim still
+        # owns the cadence: completion must not rebuild it from the execution start.
+        anchored_edit = edited and (
+            validate(old_schedule) is not None or validate(new_schedule) is not None)
+        if isinstance(claim, dict) and (
+            "manual_next_run_at" in job
+            or error_policy.selected(old_schedule)
+            or anchored_edit
+        ):
             updated["fire_claim"] = {**claim, "schedule_edited": True}
         if updated.get("manual_run_at") == updated.get("next_run_at"):
             from cron import jobs as cron_jobs

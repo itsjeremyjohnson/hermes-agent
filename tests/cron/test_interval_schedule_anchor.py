@@ -392,3 +392,38 @@ def test_success_repairs_prior_counter_without_losing_execution(outcome_runner, 
     assert final["last_status"] == "ok"
     assert effect.read_text().splitlines() == ["ok"]
     assert_outcome_cadence(final, row)
+
+
+def test_scheduled_anchor_edit_during_live_claim_keeps_operator_cadence(tmp_path, monkeypatch):
+    from cron import interval_schedule
+    start = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+    now = [start]
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now[0])
+    with jobs.use_cron_store(tmp_path):
+        job = jobs.create_job(None, "every 1h", script="synthetic.py", no_agent=True,
+                              schedule_anchor_ms=int(start.timestamp() * 1000))
+        stored = jobs.load_jobs()
+        stored[0]["next_run_at"] = start.isoformat()
+        jobs.save_jobs(stored)
+        claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+        assert isinstance(claimed["fire_claim"], dict)
+        assert "manual_next_run_at" not in claimed
+        daily_anchor = int(datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        edited = jobs.update_job(job["id"], {
+            "schedule": {"kind": "interval", "minutes": 1440, "anchor_ms": daily_anchor}})
+        assert edited["fire_claim"]["schedule_edited"] is True
+        assert "manual_next_run_at" not in edited
+        operator_next = edited["next_run_at"]
+        started = start.isoformat()
+        now[0] += timedelta(minutes=5)
+        rebuilt = interval_schedule.next_run(edited["schedule"], now[0], started)
+        assert operator_next != rebuilt
+        assert jobs.mark_job_run(
+            job["id"], True, expected_fire_owner=claimed["fire_claim"]["by"],
+            execution_started_at=started)
+        final = jobs.get_job(job["id"])
+        assert final["schedule"]["minutes"] == 1440
+        assert final["schedule"]["anchor_ms"] == daily_anchor
+        assert final["next_run_at"] == operator_next
+        assert final["fire_claim"] is None
+        assert "manual_next_run_at" not in final

@@ -162,7 +162,7 @@ def test_agent_metadata_controls_retry_without_text_overrides(runner, monkeypatc
         assert final["last_error_classification"]["reason"] == "orchestration_failed"
         assert not error_policy.transient(final["last_error"], final["last_error_classification"])
         assert jobs._parse_aware(final["next_run_at"]) > clock[0]+timedelta(seconds=30)
-    conflict = 'Session "synthetic" changed while starting work. Retry.' 
+    conflict = 'Session "synthetic" changed while starting work. Retry.'
     action["pre_error"] = RuntimeError(conflict)
     final = run(create(), {})
     assert final["last_error_classification"]["execution_started"] is False
