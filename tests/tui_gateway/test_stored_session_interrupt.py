@@ -97,3 +97,25 @@ def test_ambiguous_or_missing_stored_interrupt_never_touches_live_work(live_prof
         assert "_turn_cancel_requested" not in server._sessions[name + "-runtime"]
         profile_home = home if name == "default" else home / "profiles" / name
         assert read_marker(profile_home, key) is not None
+
+
+def test_stored_interrupt_binds_selected_profile_for_hooks(live_profiles, monkeypatch):
+    from agent.secret_scope import get_secret
+    from hermes_constants import get_hermes_home
+    from hermes_cli import plugins
+
+    server, calls, key, home, _ = live_profiles
+    seen = []
+    for name in ("alpha", "beta"):
+        (home / "profiles" / name / ".env").write_text(f"INTERRUPT_TEST_KEY={name}\n")
+    monkeypatch.setattr(plugins, "invoke_hook", lambda *a, **kw: seen.append(
+        (get_hermes_home(), get_secret("INTERRUPT_TEST_KEY"))))
+    for name in ("alpha", "beta", "alpha"):
+        server._sessions[name + "-runtime"]["running"] = True
+        response = server.handle_request({
+            "jsonrpc": "2.0", "id": name, "method": "session.interrupt",
+            "params": {"stored_session_id": key, "profile": name},
+        })
+        assert response["result"]["status"] == "interrupted"
+        assert get_hermes_home() == home
+    assert seen == [(home / "profiles" / name, name) for name in ("alpha", "beta", "alpha")]

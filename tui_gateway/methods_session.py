@@ -2100,24 +2100,25 @@ def _(rid, params: dict) -> dict:
             if not (session.get("running") and isinstance(task, dict) and task.get("task_id") == expected):
                 return _ok(rid, {"status": "not_interrupted", "interrupted": False})
     sid = str(params.get("session_id") or "")
-    if _session_uses_compute_host(session):
-        try:
-            _interrupt_session_turn(sid, session, request_id=f"interrupt-{rid}")
-        except Exception as exc:
-            return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
-        return _ok(rid, {"status": "interrupted", "turn_isolation": True})
-    if not by_stored_id:
-        session, err = _sess(params, rid)
-        if err:
-            return err
-    _interrupt_session_turn(sid, session)
-    # Retire the crash-recovery marker NOW: until the run thread's finally, a backend exit looks like a crash
-    # and session.resume auto-continues the turn the user just stopped (the extra key covers compression
-    # rotating session_key mid-turn).
-    with session["history_lock"]:
-        active_marker_key = str(session.pop("_active_turn_marker_key", "") or "")
-    _retire_turn_marker(session, active_marker_key)
-    return _ok(rid, {"status": "interrupted"})
+    with _session_profile_runtime_scope(session):
+        if _session_uses_compute_host(session):
+            try:
+                _interrupt_session_turn(sid, session, request_id=f"interrupt-{rid}")
+            except Exception as exc:
+                return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
+            return _ok(rid, {"status": "interrupted", "turn_isolation": True})
+        if not by_stored_id:
+            session, err = _sess(params, rid)
+            if err:
+                return err
+        _interrupt_session_turn(sid, session)
+        # Retire the crash-recovery marker NOW: until the run thread's finally, a backend exit looks like a crash
+        # and session.resume auto-continues the turn the user just stopped (the extra key covers compression
+        # rotating session_key mid-turn).
+        with session["history_lock"]:
+            active_marker_key = str(session.pop("_active_turn_marker_key", "") or "")
+        _retire_turn_marker(session, active_marker_key)
+        return _ok(rid, {"status": "interrupted"})
 
 
 def _apply_correction(rid, session: dict, verb: str, text: str, accepted_status: str) -> dict:
