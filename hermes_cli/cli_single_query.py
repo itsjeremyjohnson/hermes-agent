@@ -214,7 +214,6 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     )
 
     author = take_turn_author_from_env()
-    manager_reviewed = False
     # A spawner that bounds only the turn (cron Bot Chat lane) learns the outcome from this
     # report, written before the linger below; popped so tool subprocesses do not inherit it.
     turn_report_path = take_turn_report_path()

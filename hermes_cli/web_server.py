@@ -111,27 +111,15 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
                 # Even one profile needs the per-tick gateway gate; otherwise
                 # Desktop races its dedicated gateway for the same cron store.
                 start_kwargs["profile_homes"] = profile_homes
-                # Stand down for an own gateway or the default multiplexer:
-                # either ticks with live adapters, and the tick-lock race would
-                # otherwise deliver through the standalone path (#100489).
-                from hermes_cli.profiles import _check_gateway_running
-                from hermes_constants import get_default_hermes_root
-                from gateway.status import get_runtime_status_running_pid, read_runtime_status
-
-                def profile_gate(name, home):
-                    if _check_gateway_running(Path(home)):
-                        return False
-                    default_home = get_default_hermes_root()
-                    runtime = read_runtime_status(default_home / "gateway_state.json") or {}
-                    served = runtime.get("served_profiles")
-                    # Membership belongs to the live gateway's boot snapshot;
-                    # editing config.yaml cannot expand its running cron roster.
-                    return not (
-                        isinstance(served, list) and name in served
-                        and get_runtime_status_running_pid(runtime, expected_home=default_home) is not None
-                    )
-
-                start_kwargs["profile_gate"] = profile_gate
+                # Stand down, per tick, for a profile already owned by a gateway — its own
+                # process, or the live default multiplexer (a served satellite has no gateway.pid
+                # of its own). That gateway ticks with live adapters; winning the tick-lock race
+                # here would deliver through the standalone path (#100489, #107485).
+                # Identity is the canonical multiplexer-owner check: pid file plus runtime record,
+                # each proven against the live process, command line, and home.
+                start_kwargs["profile_gate"] = lambda name, home: not (
+                    _check_gateway_running(Path(home))
+                    or (name != "default" and _served_by_running_multiplexer(name)))
                 from hermes_logging import enable_profile_log_routing
 
                 enable_profile_log_routing(initial_profile_homes)

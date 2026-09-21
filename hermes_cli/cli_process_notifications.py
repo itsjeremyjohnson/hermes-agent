@@ -6,15 +6,11 @@ def quiet_results_with_manager_completions(cli, result):
     import queue
     import time
 
-    from tools.bot_mode_dm import message_agent_authorized
     from tools.interrupt import is_interrupted
     from tools.process_registry import process_registry
     from tools.process_registry_notifications import ProcessNotificationBatch
 
     yield result
-    if (getattr(cli.agent, "_bot_mode_manager", False) is not True
-            or not message_agent_authorized(cli.agent)):
-        return
     budget = process_registry._oneshot_completion_wait_seconds()
     if budget <= 0:
         return
