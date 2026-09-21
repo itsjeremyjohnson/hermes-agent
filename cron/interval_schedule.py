@@ -120,6 +120,9 @@ def preserve_manual_update(job, updated, updates):
             # Keep execution identity/outcome ownership while transferring cadence
             # to this operator edit, including a later edit back to the old value.
             updated["fire_claim"] = {**claim, "schedule_edited": True}
+        if updated.get("manual_run_at") == updated.get("next_run_at"):
+            from cron import jobs as cron_jobs
+            updated["next_run_at"] = cron_jobs.compute_next_run(updated.get("schedule") or {})
         for key in ("manual_next_run_at", "manual_run_at", "manual_run_prompt", "error_next_run_at"):
             updated.pop(key, None)
         return

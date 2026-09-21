@@ -28,6 +28,9 @@ def test_actual_transport_ambiguity_does_not_become_confirmed_delivery(tmp_path,
     receipts.prepare(job, "synthetic card", metadata={})
     target = SimpleNamespace(job=job, config=None, target_adapters={}, platform="telegram",
         platform_name="telegram", chat_id="123", thread_id=None, loop=None,
+        transport=SimpleNamespace(is_relay=False), pconfig={}, runtime_adapter=None,
+        origin={}, origin_target=False, is_dm_target=False, in_channel_surface=False,
+        inchannel_continuable=False, opened_thread_id=None, notify_delivery=False,
         where="telegram:123", is_relay=False, origin_user_id=None, mirror_text="synthetic card",
         mirror_this_target=False, live_adapter_ready=mode.startswith("live_") or mode == "inflight_timeout")
     monkeypatch.setattr(delivery, "_prepare_target_delivery", lambda *args, **kwargs: target)
@@ -82,6 +85,6 @@ def test_actual_recipient_uses_the_validated_bound_target(tmp_path, monkeypatch)
     monkeypatch.setattr(delivery, "_resolve_delivery_targets", current_route)
     receipts.prepare(job, "synthetic card", metadata={})
     recipients = []
-    monkeypatch.setattr(delivery, "_deliver_to_bot_chat", lambda j, c, p: recipients.append(p))
+    monkeypatch.setattr(delivery, "_deliver_to_bot_chat", lambda j, c, p, **kwargs: recipients.append(p))
     assert delivery._deliver_result(job, "synthetic card") is None
     assert recipients == ["wren"]

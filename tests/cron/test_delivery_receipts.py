@@ -44,7 +44,7 @@ def test_actual_deferred_queue_does_not_become_delivered_until_drain(monkeypatch
     assert E.get_execution(item["execution_id"]) is None
     monkeypatch.delenv("_HERMES_CRON_EXTERNAL_WORKER")
     seen = []
-    monkeypatch.setattr(D, "_deliver_to_bot_chat", lambda j, c, p: seen.append(c))
+    monkeypatch.setattr(D, "_deliver_to_bot_chat", lambda j, c, p, **kwargs: seen.append(c))
     assert Q.drain(lambda j, c, f: D._deliver_result(j, c, for_failure=f)) == 1
     assert seen == ["bound card"]
     queued = Q.get_status(item["execution_id"])
@@ -60,7 +60,7 @@ def test_actual_deferred_queue_does_not_become_delivered_until_drain(monkeypatch
 
 def test_immutable_binding_and_distinct_outcomes(monkeypatch):
     seen = []
-    monkeypatch.setattr(D, "_deliver_to_bot_chat", lambda j, c, p: seen.append(c) or "synthetic failed send")
+    monkeypatch.setattr(D, "_deliver_to_bot_chat", lambda j, c, p, **kwargs: seen.append(c) or "synthetic failed send")
     item = job()
     R.prepare(item, "one", metadata={})
     for changed in (dict(item, deliver="local"), dict(item, id="foreign-job")):
@@ -98,7 +98,7 @@ def test_history_retention_unknown_owners_and_unbound_defaults(tmp_path, monkeyp
     assert R.history("synthetic-job")["status"] == "unavailable"
     assert not Q._path().exists()
     calls = []
-    monkeypatch.setattr(D, "_deliver_to_bot_chat", lambda j, c, p: calls.append(c))
+    monkeypatch.setattr(D, "_deliver_to_bot_chat", lambda j, c, p, **kwargs: calls.append(c))
     assert D._deliver_result({"id": "unbound", "deliver": "bot-chat"}, "plain") is None
     assert calls == ["plain"] and not Q._path().exists()
     item = job()

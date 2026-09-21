@@ -23,7 +23,9 @@ def private_store(tmp_path, monkeypatch):
     monkeypatch.setattr(delivery_queue, "DELIVERY_DB", None)
     clock = datetime(2026, 9, 9, 3, tzinfo=timezone.utc)
     monkeypatch.setattr(jobs, "_hermes_now", lambda: clock)
-    (home / "profiles/owner").mkdir(parents=True)
+    owner_home = home / "profiles/owner"
+    owner_home.mkdir(parents=True)
+    (owner_home / ".env").write_text("", encoding="utf-8")
     with jobs.use_cron_store(home):
         yield home, clock
 
@@ -144,9 +146,11 @@ def test_shutdown_disable_queue_uses_source_profile_and_restores_context(private
         assert claimed
     token = object()
     owner = claimed["fire_claim"]["by"]
-    monkeypatch.setattr(scheduler, "_running_fire_owners", {job["id"]:{token:(owner,source_home)}})
+    scheduler._remember_inflight_home(source_home)
+    inflight = scheduler._inflight_key(job["id"], source_home)
+    monkeypatch.setattr(scheduler, "_running_fire_owners", {inflight:{token:(owner,source_home)}})
     monkeypatch.setattr(scheduler, "_restart_safe_waiter_job_ids", set())
-    monkeypatch.setattr(scheduler, "_running_job_ids", {job["id"]})
+    monkeypatch.setattr(scheduler, "_running_job_ids", {inflight})
     monkeypatch.setattr(scheduler, "_interrupted_job_ids", set())
     original_override = get_hermes_home_override()
     original_env = os.environ["HERMES_HOME"]

@@ -1956,7 +1956,7 @@ def _deliver_result(
     external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
     if (external_execution and adapters is None
             and external_execution == str(job.get("execution_id") or "")
-            and any(target["platform"] != BOT_CHAT_PLATFORM for target in targets)):
+            and targets):
         from cron.delivery_queue import enqueue_and_wait
 
         _record_delivery_verification(job, [])
