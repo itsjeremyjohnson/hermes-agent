@@ -182,3 +182,38 @@ def test_interrupt_prevents_manager_review(runtime, monkeypatch):
     assert exited.value.code == 130
     assert len(calls) == 1
     assert not registry.completion_queue.empty()
+
+
+def test_real_subprocess_completion_is_published_and_reviewed(runtime, monkeypatch):
+    """A real child exits through the registry and the manager reviews that publication.
+
+    The model turn is stubbed. The process, completion queue, and quiet-query drain are not.
+    """
+    instance, registry, _process = runtime
+    calls = []
+
+    def run(**kwargs):
+        calls.append(kwargs["user_message"])
+        return {"final_response": "reviewed", "messages": instance.conversation_history}
+
+    instance.agent.run_conversation = run
+    monkeypatch.setenv("HERMES_SESSION_ID", "manager")
+    monkeypatch.setattr(registry, "_oneshot_completion_wait_seconds", lambda: 5.0)
+    session = registry.spawn_local(
+        "sleep 0.2; printf '%s\\n' iris-worker-result-token",
+        task_id="manager-proof",
+        session_key="turn-proof",
+    )
+    session.notify_on_complete = True
+    assert session.parent_session_id == "manager"
+    try:
+        with pytest.raises(SystemExit) as exited:
+            cli._run_quiet_single_query(instance, "delegate one check")
+    finally:
+        if not session.exited:
+            registry.kill_process(session.id)
+    assert exited.value.code == 0
+    assert calls[0] == "delegate one check"
+    assert len(calls) == 2
+    assert "iris-worker-result-token" in calls[1]
+    assert registry.completion_queue.empty()

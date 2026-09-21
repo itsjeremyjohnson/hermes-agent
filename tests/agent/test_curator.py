@@ -1,7 +1,8 @@
 """Tests for agent/curator.py — orchestrator, idle gating, state transitions.
 
-LLM spawning is never exercised here — `_run_llm_review` is monkeypatched so
-tests run fully offline and the curator module doesn't need real credentials.
+LLM spawning stays offline. The review fork is stubbed, except the fallback
+test, which loads a temp-home config and drives the real agent through a fake
+chat transport.
 """
 
 from __future__ import annotations
@@ -1251,3 +1252,90 @@ def test_review_fork_seeds_shared_read_marks(curator_env, monkeypatch):
         "run_conversation, or every copied tool-worker context keeps private "
         "marks and the read-before-write guard refuses all patches"
     )
+
+
+
+def test_review_fallback_resolves_config_and_activates_through_agent(curator_env, monkeypatch):
+    """Curator fallback uses the temp-home config, real credential resolution, and AIAgent.
+
+    Only the chat-completion transport is fake. A 401 from the primary model must switch
+    the live agent onto the configured fallback and be what the review reports.
+    """
+    from types import SimpleNamespace
+
+    import agent.auxiliary_client as auxiliary_client
+    import agent.process_bootstrap as process_bootstrap
+
+    curator = curator_env["curator"]
+    home = curator_env["home"]
+    (home / "config.yaml").write_text(
+        "\n".join((
+            "model:",
+            "  provider: custom",
+            "  default: primary-review-model",
+            "  base_url: http://primary.invalid/v1",
+            "  api_key: primary-review-key",
+            "auxiliary:",
+            "  curator:",
+            "    provider: custom",
+            "    model: primary-review-model",
+            "    base_url: http://primary.invalid/v1",
+            "    api_key: primary-review-key",
+            "    fallback_chain:",
+            "      - provider: custom",
+            "        model: fallback-review-model",
+            "        base_url: http://fallback.invalid/v1",
+            "        api_key: fallback-review-key",
+            "        api_mode: chat_completions",
+            "",
+        )),
+        encoding="utf-8",
+    )
+    import importlib
+    importlib.reload(curator)
+
+    requested = []
+    constructed = []
+
+    class _AuthFailure(Exception):
+        status_code = 401
+
+        def __str__(self):
+            return "Error code: 401 - invalid key"
+
+    class _Transport:
+        def __init__(self, *args, **kwargs):
+            self.api_key = kwargs.get("api_key")
+            self.base_url = kwargs.get("base_url")
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+            constructed.append(self)
+
+        def create(self, **kwargs):
+            model = kwargs.get("model")
+            requested.append(model)
+            if model == "primary-review-model":
+                raise _AuthFailure()
+            message = SimpleNamespace(content="fallback served", tool_calls=None, refusal=None)
+            choice = SimpleNamespace(message=message, finish_reason="stop")
+            return SimpleNamespace(choices=[choice], model=model, usage=None)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(process_bootstrap, "OpenAI", _Transport)
+    monkeypatch.setattr(auxiliary_client, "OpenAI", _Transport)
+    result = curator._run_llm_review("review the skill tree")
+
+    assert result.get("error") is None, result
+    assert result["model"] == "fallback-review-model"
+    assert result["provider"] == "custom"
+    assert result["final"] == "fallback served"
+    assert requested[0] == "primary-review-model"
+    assert "fallback-review-model" in requested
+    assert requested.index("primary-review-model") < requested.index("fallback-review-model")
+    identities = [(client.api_key, str(client.base_url).rstrip("/")) for client in constructed]
+    primary = ("primary-review-key", "http://primary.invalid/v1")
+    fallback = ("fallback-review-key", "http://fallback.invalid/v1")
+    assert primary in identities
+    assert fallback in identities
+    assert identities.index(primary) < identities.index(fallback)
