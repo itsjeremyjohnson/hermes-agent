@@ -173,9 +173,16 @@ def track_delivery(send):
         expected = tuple(binding[key] for key in ("execution_id", "job_id", "started_at", "content_sha256", "route_sha256"))
         if identity != expected or not targets:
             raise ValueError("delivery does not match its prepared execution/content/route binding")
-        # Enqueue/wait may return None while still pending. Only drain's actual
-        # transport call may claim and terminalize this receipt.
-        if adapters is None and os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == identity[0]:
+        # A non-Bot-Chat external worker only queues the send. None from that wait
+        # means still pending, so this call must not claim or terminalize the receipt.
+        # Bot Chat is delivered directly and has to record that outcome now.
+        from cron.scheduler_delivery import BOT_CHAT_PLATFORM
+        deferred = (
+            adapters is None
+            and os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == identity[0]
+            and any(str(target.get("platform") or "") != BOT_CHAT_PLATFORM for target in targets)
+        )
+        if deferred:
             return send(job, content, adapters=adapters, loop=loop, for_failure=for_failure)
         with delivery_queue._transaction() as conn:
             _schema(conn)

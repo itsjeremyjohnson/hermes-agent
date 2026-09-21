@@ -138,12 +138,17 @@ def test_failure_stops_own_session_descendant_and_reader_threads(home, cause):
         assert {"timeout": "timed out", "cancel": "ownership"}[cause] in error
         assert time.monotonic() - started < 12
         pid = int(pidfile.read_text())
+        def stopped(process_id):
+            if not psutil.pid_exists(process_id):
+                return True
+            try:
+                return psutil.Process(process_id).status() == psutil.STATUS_ZOMBIE
+            except psutil.NoSuchProcess:
+                return True
         deadline = time.monotonic() + 3
-        while psutil.pid_exists(pid) and time.monotonic() < deadline:
-            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
-                break
+        while not stopped(pid) and time.monotonic() < deadline:
             time.sleep(.02)
-        assert not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+        assert stopped(pid)
         assert not any(t.name.startswith("cron-script-output-") for t in threading.enumerate())
     finally:
         if cancel_thread is not None:
@@ -171,12 +176,17 @@ def test_timeout_releases_readers_after_leader_exits(home, detached):
         assert not ok and "timed out" in error
         pid = int(pidfile.read_text())
         if not detached:
+            def stopped(process_id):
+                if not psutil.pid_exists(process_id):
+                    return True
+                try:
+                    return psutil.Process(process_id).status() == psutil.STATUS_ZOMBIE
+                except psutil.NoSuchProcess:
+                    return True
             deadline = time.monotonic() + 3
-            while psutil.pid_exists(pid) and time.monotonic() < deadline:
-                if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
-                    break
+            while not stopped(pid) and time.monotonic() < deadline:
                 time.sleep(.02)
-            assert not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+            assert stopped(pid)
         # A detached, already-reparented process no longer has provable ancestry. The
         # runner must release its readers without claiming that process was terminated.
         assert not any(t.name.startswith("cron-script-output-") for t in threading.enumerate())

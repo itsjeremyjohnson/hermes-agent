@@ -29,6 +29,7 @@ def job():
 
 def test_actual_deferred_queue_does_not_become_delivered_until_drain(monkeypatch):
     item = job()
+    item["deliver"] = "telegram:123"
     original_start = E.get_execution(item["execution_id"])["started_at"]
     R.prepare(item, "bound card", metadata={"version": 1})
     monkeypatch.setattr(Q, "DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS", 0)
@@ -44,7 +45,30 @@ def test_actual_deferred_queue_does_not_become_delivered_until_drain(monkeypatch
     assert E.get_execution(item["execution_id"]) is None
     monkeypatch.delenv("_HERMES_CRON_EXTERNAL_WORKER")
     seen = []
-    monkeypatch.setattr(D, "_deliver_to_bot_chat", lambda j, c, p, **kwargs: seen.append(c))
+
+    def prepare_target(queued_job, target, **kwargs):
+        return type("Target", (), {
+            "job": queued_job,
+            "platform": target["platform"],
+            "platform_name": target["platform"],
+            "chat_id": target["chat_id"],
+            "thread_id": None,
+            "is_relay": False,
+            "live_adapter_ready": False,
+            "where": target["platform"] + ":" + str(target["chat_id"]),
+            "mirror_text": "",
+            "mirror_this_target": False,
+            "origin_user_id": None,
+        })()
+
+    monkeypatch.setattr(D, "_prepare_target_delivery", prepare_target)
+    monkeypatch.setattr(D, "_maybe_mirror_cron_delivery", lambda *args, **kwargs: None)
+
+    def standalone(target, content, media):
+        seen.append(content)
+        return {"success": True, "message_id": "synthetic-message"}, None
+
+    monkeypatch.setattr(D, "_standalone_send", standalone)
     assert Q.drain(lambda j, c, f: D._deliver_result(j, c, for_failure=f)) == 1
     assert seen == ["bound card"]
     queued = Q.get_status(item["execution_id"])
@@ -56,6 +80,23 @@ def test_actual_deferred_queue_does_not_become_delivered_until_drain(monkeypatch
     with pytest.raises(ValueError, match="no replay"):
         D._deliver_result(item, "bound card")
     assert seen == ["bound card"]
+
+
+def test_external_worker_bot_chat_records_the_direct_send(monkeypatch):
+    seen = []
+
+    def deliver(job, content, profile, **kwargs):
+        seen.append(content)
+
+    monkeypatch.setattr(D, "_deliver_to_bot_chat", deliver)
+    item = job()
+    R.prepare(item, "bound card", metadata={})
+    monkeypatch.setenv("_HERMES_CRON_EXTERNAL_WORKER", item["execution_id"])
+    assert D._deliver_result(item, "bound card") is None
+    assert seen == ["bound card"]
+    assert Q.get_status(item["execution_id"]) is None
+    receipt = R.history(item["id"])["records"][0]
+    assert receipt["outcome"] == "delivered" and receipt["content_sha256"] == R.digest("bound card")
 
 
 def test_immutable_binding_and_distinct_outcomes(monkeypatch):

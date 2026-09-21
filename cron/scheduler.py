@@ -2951,8 +2951,8 @@ def _save_compose_deliver(
     fence; a lost claim raises ``_FireClaimLostDuringSideEffect`` for the caller)."""
     job = d.job
     if job.get("failure_alert_cooldown_seconds") is not None:
-        d.skipped = bool(job.pop("_failure_alert_skipped", False)) or str(d.error or "").startswith(
-            (DRIFT_SKIP_MARKER, DRIFT_SKIP_SILENT_MARKER))
+        # Skip is the gate set by monitor, wake, and empty-output paths.
+        d.skipped = bool(job.pop("_failure_alert_skipped", False))
     with fence.side_effect_fence() as owns_output:
         if not owns_output:
             raise _FireClaimLostDuringSideEffect
@@ -3134,7 +3134,7 @@ def _deliver_crash_failure(
     if job.get("failure_alert_cooldown_seconds") is not None:
         from cron import failure_alerts
 
-        skipped = str(err_text).startswith((DRIFT_SKIP_MARKER, DRIFT_SKIP_SILENT_MARKER))
+        skipped = bool(job.pop("_failure_alert_skipped", False))
         suppression = None
         if skipped:
             suppression = "suppressed_skipped"
@@ -4213,8 +4213,7 @@ from cron.scheduler_prompt import (  # noqa: E402
     _block_and_pause_job, _build_job_prompt, _guard_job_credential_exfil, _parse_wake_gate,
 )
 from cron.scheduler_preflight import (  # noqa: E402
-    BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, DRIFT_SKIP_MARKER,
-    DRIFT_SKIP_SILENT_MARKER, _cron_preflight_enabled,
+    BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, _cron_preflight_enabled,
     _empty_requested_mcp_toolsets, _is_transient_provider_resolve_error, _preflight_job_config,
 )
 

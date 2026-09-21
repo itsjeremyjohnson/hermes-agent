@@ -122,9 +122,10 @@ def test_anchor_epoch_boundaries_and_legacy_defaults(tmp_path, monkeypatch):
             assert result.timestamp() == start.timestamp()+64800
         now = datetime.fromtimestamp(start.timestamp()-1, chicago)
         assert datetime.fromisoformat(jobs.compute_next_run(schedule)).timestamp() == start.timestamp()
-        # Omitted anchor keeps existing completion-based, wall-clock default behavior.
+        # Omitted anchor keeps elapsed duration across a DST offset change.
         legacy = {"kind": "interval", "minutes": 360}
-        assert jobs.compute_next_run(legacy, start.isoformat()) == (start+timedelta(hours=6)).isoformat()
+        legacy_next = datetime.fromisoformat(jobs.compute_next_run(legacy, start.isoformat()))
+        assert legacy_next.astimezone(timezone.utc) - start.astimezone(timezone.utc) == timedelta(hours=6)
         assert interval_schedule.validate(legacy) is None
     with jobs.use_cron_store(tmp_path):
         plain = jobs.create_job(None, "every 6h", script="synthetic.py", no_agent=True)

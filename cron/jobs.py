@@ -1198,10 +1198,9 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         minutes = schedule.get("minutes")
         if minutes is None:
             return None
-        # Unanchored intervals keep aware-datetime addition. That is the historical
-        # completion offset, including the wall time produced across a DST change.
-        # Anchored intervals already returned through interval_schedule.next_run.
-        return (base_time + timedelta(minutes=minutes)).isoformat()
+        # Add in UTC so an interval keeps its duration when the profile's UTC offset changes.
+        next_run = base_time.astimezone(timezone.utc) + timedelta(minutes=minutes)
+        return next_run.astimezone(base_time.tzinfo).isoformat()
     if kind == "cron":
         zone = _cron_timezone(schedule)
         if zone is not None:

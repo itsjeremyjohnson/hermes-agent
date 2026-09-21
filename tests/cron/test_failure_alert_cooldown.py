@@ -151,8 +151,10 @@ def test_scheduler_normal_crash_skip_and_ack_share_request_policy(tmp_path, monk
 
         monkeypatch.setattr(scheduler, "_deliver_result", deliver)
 
-        def normal(error, success=False):
+        def normal(error, success=False, skipped=False):
             live = jobs.get_job(job["id"])
+            if skipped:
+                live["_failure_alert_skipped"] = True
             execution = executions.create_execution(job["id"], source="direct")
             d = scheduler._RunDelivery(job=live, success=success, error=error)
             scheduler._save_compose_deliver(
@@ -180,7 +182,7 @@ def test_scheduler_normal_crash_skip_and_ack_share_request_policy(tmp_path, monk
             jobs.get_job(job["id"]), "crash after boundary", adapters=None, loop=None)
         assert error and outcome == "failed" and len(deliveries) == 2
         now[0] += timedelta(hours=6)
-        skipped = normal(scheduler.DRIFT_SKIP_MARKER + " synthetic drift")
+        skipped = normal("synthetic drift", skipped=True)
         assert not skipped.delivery_attempted
         assert jobs.get_job(job["id"])["failure_alert_state"]["outcome"] == "suppressed_skipped"
         configured = normal(scheduler.BLOCKED_CONFIG_MARKER + " synthetic malformed config")
