@@ -163,6 +163,7 @@ def test_lock_owned_serve_pids_reads_valid_backend_lock(tmp_path):
     assert _lock_owned_serve_pids(base_dir=lock_root) == {7777}
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize("active_profile", [None, "wren"])
 def test_reap_preserves_root_owned_profiles_and_reaps_unowned_orphan(tmp_path, monkeypatch, active_profile):
     """Named profile startup must see the shared SSH locks, including siblings."""
@@ -184,7 +185,6 @@ def test_reap_preserves_root_owned_profiles_and_reaps_unowned_orphan(tmp_path, m
         patch("hermes_cli.dashboard_procs._process_ppid", return_value=1),
         patch("os.kill") as kill,
         patch("psutil.pid_exists", return_value=False),
-        patch("sys.platform", "linux"),
     ):
         result = _reap_orphaned_desktop_local_serves(
             sleep_fn=lambda _: None, process_age_seconds_fn=lambda _: 600.0,

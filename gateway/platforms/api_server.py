@@ -1447,60 +1447,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         normalized = (value or "").strip().lower().replace("-", "_")
         return normalized if re.fullmatch(r"[a-z0-9_]+", normalized) else ""
 
-    _PLATFORM_EVENT_ROUTE_PATH_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9_/-]*$")
-    _PLATFORM_EVENT_ROUTE_RESERVED_PREFIXES = ("/api/", "/v1/", "/p/")
-    _PLATFORM_EVENT_ROUTE_RESERVED_PATHS = frozenset({
-        "/health", "/health/detailed", "/v1/health",
-    })
-
     def _parse_platform_event_routes(self, raw: Any) -> tuple[Dict[str, str], Optional[str]]:
-        """Validate ``extra.platform_event_routes`` as exact path -> platform.
+        """Validate ``extra.platform_event_routes`` as exact path -> platform."""
+        from gateway.platforms.api_server_event_routes import parse_platform_event_routes
 
-        Invalid config is returned as an error string so ``connect()`` can refuse
-        before binding a listener. Absent/empty mappings are a no-op.
-        """
-        if raw is None or raw == {}:
-            return {}, None
-        if not isinstance(raw, dict):
-            return {}, "platform_event_routes must be a mapping of exact path to platform"
         native_paths = {path for _method, path, _handler in self._http_route_table()}
-        routes: Dict[str, str] = {}
-        seen_platforms: Dict[str, str] = {}
-        for path, platform in raw.items():
-            if not isinstance(path, str):
-                return {}, f"platform_event_routes path must be a string, got {type(path).__name__}"
-            path = path.strip()
-            if (
-                not self._PLATFORM_EVENT_ROUTE_PATH_RE.fullmatch(path)
-                or path.endswith("/")
-                or "//" in path
-            ):
-                return {}, f"platform_event_routes path {path!r} is not an exact public callback path"
-            if (
-                path in self._PLATFORM_EVENT_ROUTE_RESERVED_PATHS
-                or path in native_paths
-                or any(path.startswith(prefix) for prefix in self._PLATFORM_EVENT_ROUTE_RESERVED_PREFIXES)
-            ):
-                return {}, f"platform_event_routes path {path!r} conflicts with a reserved API route"
-            if not isinstance(platform, str):
-                return {}, (
-                    f"platform_event_routes[{path!r}] must be a platform name string, "
-                    f"got {type(platform).__name__}"
-                )
-            platform_name = self._normalize_callback_platform(platform)
-            if not platform_name:
-                return {}, f"platform_event_routes[{path!r}] has an invalid platform name"
-            if path in routes:
-                return {}, f"platform_event_routes path {path!r} is duplicated"
-            prior = seen_platforms.get(platform_name)
-            if prior is not None and prior != path:
-                return {}, (
-                    f"platform_event_routes maps {prior!r} and {path!r} to the same platform "
-                    f"{platform_name!r}"
-                )
-            routes[path] = platform_name
-            seen_platforms[platform_name] = path
-        return routes, None
+        return parse_platform_event_routes(
+            raw,
+            native_paths=native_paths,
+            normalize_platform=self._normalize_callback_platform,
+        )
 
     def _platform_event_alias_route_table(self) -> List[tuple]:
         """Exact POST aliases from ``platform_event_routes``; not mirrored under /p/<profile>/."""

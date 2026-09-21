@@ -53,6 +53,19 @@ curl http://localhost:8642/v1/chat/completions \
 
 Or connect Open WebUI, LobeChat, or any other frontend — see the [Open WebUI integration guide](../messaging/open-webui.md) for step-by-step instructions.
 
+## Platform event aliases
+
+Messaging platforms that cannot use `/api/platforms/<platform>/events` can be given an exact POST path on the default API listener:
+
+```yaml
+gateway:
+  api_server:
+    platform_event_routes:
+      /googlechat: google_chat
+```
+
+Each path is one exact callback, not a prefix, and it is not copied under `/p/<profile>/`. The request is verified and handled by the default profile's adapter for that platform. A path that matches a built-in API route, or two paths that name the same platform, is refused when the API server starts. Leave the mapping empty when you do not need aliases.
+
 ## Endpoints
 
 ### POST /v1/chat/completions

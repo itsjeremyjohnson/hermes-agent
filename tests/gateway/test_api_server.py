@@ -2092,6 +2092,49 @@ class _AliasGatewayRunner(GatewayAuthorizationMixin, types.SimpleNamespace):
 
 
 class TestPlatformEventRouteAliases:
+    def test_default_routes_are_empty_and_yaml_reaches_the_adapter(self, tmp_path, monkeypatch):
+        """A temp config.yaml must deliver platform_event_routes through load_gateway_config."""
+        for key in (
+            "API_SERVER_ENABLED",
+            "API_SERVER_KEY",
+            "API_SERVER_PORT",
+            "API_SERVER_HOST",
+            "API_SERVER_CORS_ORIGINS",
+            "API_SERVER_MODEL_NAME",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        home = tmp_path / "hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "gateway:\n"
+            "  api_server:\n"
+            "    enabled: true\n"
+            "    key: test-api-server-key-ok\n"
+            "    platform_event_routes:\n"
+            "      \"/googlechat\": google_chat\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+        from gateway.config import load_gateway_config
+
+        assert DEFAULT_CONFIG["gateway"]["api_server"]["platform_event_routes"] == {}
+        loaded = load_gateway_config()
+        routes = loaded.platforms[Platform.API_SERVER].extra["platform_event_routes"]
+        assert routes == {"/googlechat": "google_chat"}
+
+        adapter = APIServerAdapter(loaded.platforms[Platform.API_SERVER])
+        assert adapter._platform_event_routes_error is None
+        assert adapter._platform_event_routes == {"/googlechat": "google_chat"}
+
+    def test_stripped_duplicate_paths_are_rejected(self, monkeypatch):
+        monkeypatch.delenv("API_SERVER_KEY", raising=False)
+        adapter = _make_alias_adapter({" /googlechat": "google_chat", "/googlechat": "google_chat"})
+        assert adapter._platform_event_routes_error
+        assert "duplicated" in adapter._platform_event_routes_error
+        assert "'/googlechat'" in adapter._platform_event_routes_error
+
     def test_reserved_alias_fails_before_listener_starts(self, monkeypatch):
         monkeypatch.delenv("API_SERVER_KEY", raising=False)
         adapter = _make_alias_adapter({"/v1/models": "google_chat"})
