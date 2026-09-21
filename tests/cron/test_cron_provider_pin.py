@@ -186,3 +186,27 @@ class TestRuntimeResolutionTargetModel:
         assert success is True, error
         assert resolve_kwargs["target_model"] == "my-pinned-model"
         assert resolve_kwargs["requested"] == "openrouter"
+
+
+def test_update_snapshot_prefers_effective_cron_model(tmp_path, monkeypatch):
+    """Update records use the effective loader: cron.model, else expanded model.default."""
+    monkeypatch.setenv("HERMES_SNAPSHOT_MODEL", "from-env")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    def home(name):
+        path = tmp_path / name
+        path.mkdir()
+        monkeypatch.setenv("HOME", str(path))
+        monkeypatch.setenv("HERMES_HOME", str(path))
+        monkeypatch.setenv("USERPROFILE", str(path))
+        return path
+
+    cron_home = home("cron-model")
+    (cron_home / "config.yaml").write_text(
+        "cron:\n  model: cron-model\nmodel:\n  default: ${HERMES_SNAPSHOT_MODEL}\n")
+    from cron.jobs import _resolve_default_model_snapshot
+    assert _resolve_default_model_snapshot() == "cron-model"
+
+    default_home = home("default-model")
+    (default_home / "config.yaml").write_text("model:\n  model: ${HERMES_SNAPSHOT_MODEL}\n")
+    assert _resolve_default_model_snapshot() == "from-env"

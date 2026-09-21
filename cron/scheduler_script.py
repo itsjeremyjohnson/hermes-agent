@@ -9,7 +9,6 @@ late-bound (``_sched`` / module refs at the bottom) so monkeypatching the defini
 from __future__ import annotations
 
 import contextlib
-import contextvars
 import logging
 import os
 import shutil
@@ -392,7 +391,7 @@ def _collect_bounded_script_output(
             # script starts its own session; its surviving POSIX group remains ours to stop.
             if proc.returncode is not None and sys.platform != "win32":
                 with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only branch
         for reader in readers:
             reader.join(timeout=1.0)
         for stream in (proc.stdout, proc.stderr):
@@ -536,8 +535,8 @@ def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.
     """Start ``loop_fn`` on a daemon thread inside a copy of the current context (multiplexed
     profile ContextVars). On failure calls ``fail_log()`` inside the except (traceback intact) and
     returns None."""
-    thread = threading.Thread(
-        target=contextvars.copy_context().run, args=(loop_fn,), name=name, daemon=True)
+    from agent.memory_provider import spawn_context_thread
+    thread = spawn_context_thread(loop_fn, name=name, daemon=True)
     try:
         thread.start()
     except Exception:

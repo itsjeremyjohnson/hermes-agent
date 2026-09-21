@@ -9,7 +9,7 @@ from hermes_constants import get_hermes_home
 from agent.secret_scope import (
     UnscopedSecretError, _is_global_env, current_secret_scope, is_multiplex_active,
 )
-from tools.environments.local import build_subprocess_env
+from tools.environments.local import build_subprocess_env, served_profile_child_env
 
 
 WORKER_MARKER = "_HERMES_CRON_EXTERNAL_WORKER"
@@ -58,13 +58,17 @@ def build_cron_script_env() -> dict[str, str]:
     scope = current_secret_scope()
     if scope is None:
         raise UnscopedSecretError('multiplex cron script requires its profile secret scope')
-    # Worker processes may inherit default-profile .env values. Correct HOME
-    # alone cannot make an unregistered CLI key safe: missing own keys must stay
-    # missing, and keys absent from the parent's env must still reach this job.
+    # served_profile_child_env pins the active home and strips launch-profile residue.
+    # Its default process snapshot still carries unregistered secrets, and passing the
+    # target home with inherit_credentials rereads the profile from disk. The bound
+    # scope remains the only non-global credential source. The cron sanitizer still
+    # drops provider credentials and keeps the worker marker.
     base = {key: value for key, value in os.environ.items() if _is_global_env(key)}
-    # Raw profile dotenv scopes may contain deployment names. Those retain the
-    # same process authority as get_secret; only profile-owned values overlay.
-    base.update((key, value) for key, value in scope.items() if not _is_global_env(key))
+    env = served_profile_child_env(
+        base, target_home=get_hermes_home(), inherit_credentials=False)
+    env.update(
+        (key, value) for key, value in scope.items()
+        if value is not None and not _is_global_env(key))
     if worker_execution:
-        base[WORKER_MARKER] = worker_execution
-    return build_subprocess_env(base=base)
+        env[WORKER_MARKER] = worker_execution
+    return build_subprocess_env(env)

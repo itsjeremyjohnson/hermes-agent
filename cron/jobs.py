@@ -1720,22 +1720,15 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
 
 
 def _resolve_default_model_snapshot() -> Optional[str]:
-    """Default model resolved as the ticker's run_job does, so an inference update can snapshot it.
+    """Default model from the effective user config, so an inference update can snapshot it.
 
-    None on missing config or failure. Upstream fire no longer reads these keys; update still
-    records them when provider, model, base_url, or no_agent actually changes.
+    Selection stays cron.model, then model.default or model.model. None when that id is
+    absent or the effective config cannot be read. Upstream fire no longer reads these keys.
     """
     try:
-        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+        from hermes_cli.config_effective import load_user_config_effective
 
-        cfg_path = get_hermes_home() / "config.yaml"
-        if not cfg_path.exists():
-            return None
-        cfg = read_user_config_raw(cfg_path)
-        with contextlib.suppress(Exception):
-            from hermes_cli import managed_scope
-            cfg = managed_scope.apply_managed_overlay(cfg)
-        cfg = _expand_env_vars(cfg)
+        cfg = load_user_config_effective(get_hermes_home() / "config.yaml")
         cron_cfg = cfg.get("cron") or {}
         if isinstance(cron_cfg, dict):
             cron_model = cron_cfg.get("model")
