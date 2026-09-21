@@ -470,6 +470,22 @@ class TestResourceIdentity:
         assert event.source.user_id_alt == "alice@example.com"
         assert getattr(event.source, "role_authorized", False) is not True
 
+    def test_email_match_ignores_case_and_resource_match_does_not(self):
+        from plugins.platforms.google_chat.adapter import _gchat_user_matches
+
+        assert _gchat_user_matches("User@example.com", {"user@example.com"}) is True
+        assert _gchat_user_matches("users/AbC", {"users/abc"}) is False
+        email_adapter = GoogleChatAdapter(_parity_config(
+            dm_policy="allowlist", group_policy="", groups={}, allow_from="user@example.com",
+        ))
+        resource_adapter = GoogleChatAdapter(_parity_config(
+            dm_policy="allowlist", group_policy="", groups={}, allow_from="users/abc",
+        ))
+        assert email_adapter._is_dm_allowed("User@example.com") is True
+        assert email_adapter._is_dm_allowed("users/AbC") is False
+        assert resource_adapter._is_dm_allowed("users/abc") is True
+        assert resource_adapter._is_dm_allowed("users/AbC") is False
+
 
 class TestEmailAuthorizationBoundary:
     @pytest.mark.asyncio

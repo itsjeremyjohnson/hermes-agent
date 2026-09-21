@@ -407,12 +407,24 @@ def _normalize_gchat_user_id(raw: Optional[str]) -> str:
     return value
 
 
+def _gchat_email_key(value: str) -> Optional[str]:
+    """Lowercased email, or None when *value* is a resource id.
+
+    Mailbox comparison stays case-insensitive. A ``users/`` resource is never
+    folded, including when its suffix contains ``@``.
+    """
+    if "@" not in value or value.startswith("users/"):
+        return None
+    return value.lower()
+
+
 def _gchat_user_forms(raw: Optional[str]) -> set[str]:
     value = str(raw or "").strip()
     if not value:
         return set()
-    if "@" in value and not value.startswith("users/"):
-        return {value}
+    email = _gchat_email_key(value)
+    if email is not None:
+        return {email}
     bare = _normalize_gchat_user_id(value)
     if not bare:
         return {value}
@@ -625,14 +637,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
         return False
 
     def _dm_sender_matches(self, sender_name: str, sender_email: str) -> bool:
-        principal = sender_name or sender_email
-        if self._dm_policy in {"", "pairing"}:
-            return bool(principal)
-        if self._dm_policy == "disabled":
-            return False
-        if principal and self._is_dm_allowed(principal):
+        if sender_name and self._is_dm_intake_allowed(sender_name):
             return True
-        return bool(sender_email) and sender_email != principal and self._is_dm_allowed(sender_email)
+        return bool(sender_email) and sender_email != sender_name and self._is_dm_intake_allowed(sender_email)
 
     def _group_sender_matches(self, chat_id: str, sender_name: str, sender_email: str) -> bool:
         principal = sender_name or sender_email
