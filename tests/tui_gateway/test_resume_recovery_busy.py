@@ -80,4 +80,3 @@ def test_cold_and_warm_resume_keep_recovery_pending_busy(pending_recovery, warm)
     assert settled['running'] is False
     assert settled['status'] == 'idle'
     assert len(submissions) == 1
-

@@ -512,7 +512,10 @@ method("session.compress", params=SessionCompressParams, result=SessionCompressR
 # ── interrupt / steer / redirect ──────────────────────────────────────────────────────────────
 
 
-class SessionInterruptParams(SessionParams):
+class SessionInterruptParams(ProfileParams):
+    # The handler requires one live id, or one stored id with an explicit profile.
+    session_id: str | None = None
+    stored_session_id: str | None = None
     expected_hosted_task_id: str | None = None  # only interrupt if this hosted task is the running one
 
 

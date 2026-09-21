@@ -2893,8 +2893,9 @@ export interface CompressionSummary {
   [key: string]: unknown
 }
 export interface SessionInterruptParams {
-  session_id: string
   profile?: string | null
+  session_id?: string | null
+  stored_session_id?: string | null
   expected_hosted_task_id?: string | null
 }
 export interface SessionInterruptResult {

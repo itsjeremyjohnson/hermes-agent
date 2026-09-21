@@ -41,7 +41,6 @@ def live_profiles(tmp_path, monkeypatch):
         pytest.fail("cancellation must not create/resume/build an agent or schedule continuation")
 
     monkeypatch.setattr(server, "_maybe_schedule_auto_continue", forbidden)
-    monkeypatch.setattr(server, "_start_agent_build", forbidden)
     monkeypatch.setitem(server._methods, "session.resume", forbidden)
     monkeypatch.setitem(server._methods, "session.create", forbidden)
     yield server, calls, key, home, read_turn_marker
@@ -49,10 +48,16 @@ def live_profiles(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("profile", ["default", "alpha", "beta"])
-def test_stored_interrupt_selects_exact_profile_and_retires_only_its_marker(live_profiles, profile):
+@pytest.mark.parametrize("identity", ["stored", "runtime"])
+def test_stored_interrupt_selects_exact_profile_and_retires_only_its_marker(live_profiles, monkeypatch, profile, identity):
     server, calls, key, home, read_marker = live_profiles
-    response = server._methods["session.interrupt"]("stop", {
-        "stored_session_id": key, "profile": profile,
+    if identity == "stored":
+        monkeypatch.setattr(server, "_start_agent_build", lambda *a, **kw: pytest.fail("stored interrupt must not build an agent"))
+    params = {"profile": profile}
+    params["stored_session_id" if identity == "stored" else "session_id"] = (
+        key if identity == "stored" else profile + "-runtime")
+    response = server.handle_request({
+        "jsonrpc": "2.0", "id": "stop", "method": "session.interrupt", "params": params,
     })
     assert response["result"]["status"] == "interrupted"
     assert calls == [profile]
@@ -82,7 +87,9 @@ def test_stored_interrupt_selects_exact_profile_and_retires_only_its_marker(live
 def test_ambiguous_or_missing_stored_interrupt_never_touches_live_work(live_profiles, params, code):
     server, calls, key, home, read_marker = live_profiles
     before = set(server._sessions)
-    response = server._methods["session.interrupt"]("stop", params)
+    response = server.handle_request({
+        "jsonrpc": "2.0", "id": "stop", "method": "session.interrupt", "params": params,
+    })
     assert response["error"]["code"] == code
     assert calls == []
     assert set(server._sessions) == before

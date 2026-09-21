@@ -26042,10 +26042,6 @@
       "SessionInterruptParams": {
         "additionalProperties": false,
         "properties": {
-          "session_id": {
-            "title": "Session Id",
-            "type": "string"
-          },
           "profile": {
             "anyOf": [
               {
@@ -26057,6 +26053,30 @@
             ],
             "default": null,
             "title": "Profile"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          },
+          "stored_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Stored Session Id"
           },
           "expected_hosted_task_id": {
             "anyOf": [
@@ -26071,9 +26091,6 @@
             "title": "Expected Hosted Task Id"
           }
         },
-        "required": [
-          "session_id"
-        ],
         "title": "SessionInterruptParams",
         "type": "object"
       },
