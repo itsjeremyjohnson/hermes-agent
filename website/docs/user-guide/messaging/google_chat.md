@@ -30,7 +30,7 @@ cannot host Chat apps.
 | **Inbound transport** | Cloud Pub/Sub pull subscription (no public endpoint) |
 | **Outbound transport** | Chat REST API (`chat.googleapis.com`) |
 | **Authentication** | Service Account JSON with `roles/pubsub.subscriber` on the subscription |
-| **User identification** | Chat resource names (`users/{id}`) + email |
+| **User identification** | Exact Chat resource name (`users/{id}`) on parity mode; the event email remains an authorization grant |
 
 ---
 
@@ -146,7 +146,7 @@ self-message filtering.
 
 ## Step 9: Configure Hermes
 
-Add the Google Chat section to `~/.hermes/.env`:
+Put credentials in `~/.hermes/.env`. Behavior for an already configured install lives in `platforms.google_chat.extra` inside `~/.hermes/config.yaml` (see [Access and identity](#access-and-identity)).
 
 ```bash
 # Required
@@ -154,7 +154,7 @@ GOOGLE_CHAT_PROJECT_ID=my-chat-bot-123
 GOOGLE_CHAT_SUBSCRIPTION_NAME=projects/my-chat-bot-123/subscriptions/hermes-chat-events-sub
 GOOGLE_CHAT_SERVICE_ACCOUNT_JSON=/home/you/.hermes/google-chat-sa.json
 
-# Authorization — paste the emails of people allowed to talk to the bot
+# Gateway allowlist. Emails and exact users/{id} values. Still read from the environment.
 GOOGLE_CHAT_ALLOWED_USERS=you@yourdomain.com,coworker@yourdomain.com
 
 # Optional
@@ -166,14 +166,64 @@ GOOGLE_CHAT_MAX_BYTES=16777216                  # 16 MiB — cap on in-flight me
 The project ID also falls back to `GOOGLE_CLOUD_PROJECT`, and the SA path falls
 back to `GOOGLE_APPLICATION_CREDENTIALS` — use whichever convention you prefer.
 
-Under a [multi-profile gateway](../multi-profile-gateways.md), every
-`GOOGLE_CHAT_*` setting is read from the routed profile's own `.env`; a
+Under a [multi-profile gateway](../multi-profile-gateways.md), credentials,
+`GOOGLE_CHAT_ALLOWED_USERS`, and any behavior variable that is not set in that
+profile's `config.yaml` are read from the routed profile's own `.env`. A
 secondary profile never inherits the default profile's project, subscription,
 or service account. If a profile has no SA configured while the process
 environment carries one for another profile, the adapter refuses to fall back
 to Application Default Credentials (which would authenticate as that other
-profile) and logs an explicit error instead — put
+profile) and logs an explicit error instead. Put
 `GOOGLE_CHAT_SERVICE_ACCOUNT_JSON` in that profile's `.env`.
+
+## Access and identity
+
+With `dm_policy`, `group_policy`, and `groups` all unset, the sender email is
+`user_id`. `GOOGLE_CHAT_ALLOWED_USERS` and approved pairing records match that
+email exactly, as they did before.
+
+Setting any of those keys turns on source parity. The current config shape is
+`platforms.google_chat.extra`:
+
+```yaml
+platforms:
+  google_chat:
+    enabled: true
+    extra:
+      dm_policy: pairing          # default once parity is on, when this key is absent
+      group_policy: allowlist     # default once parity is on, when this key is absent
+      require_mention: true       # default for groups once parity is on
+      bot_user: users/123
+      groups:
+        spaces/AAAA:
+          enabled: true
+          users:
+            - users/456
+```
+
+`user_id` is then the exact resource name from the event, `users/{id}`.
+`users/AbC` and `users/abc` are different senders. The email on that same
+event stays on `user_id_alt` and is still an email grant: an entry in
+`GOOGLE_CHAT_ALLOWED_USERS`, an approved pairing record, or `allow_from` /
+`allowFrom` that equals that email authorizes the event. It does not make a
+different resource name the same user. New pairing approvals store the
+resource id. Older approvals that stored the email still match the email on
+the event.
+
+`allow_from` may be a list or one scalar string (`you@yourdomain.com` or
+`you@yourdomain.com,coworker@yourdomain.com`). `allowFrom` is the same field.
+Group `users` entries follow the same exact resource and exact email match.
+
+These behavior keys are read from YAML. The environment names below still
+apply when the YAML key is absent, and a warning is logged once per process:
+
+- `GOOGLE_CHAT_DM_POLICY`
+- `GOOGLE_CHAT_GROUP_POLICY`
+- `GOOGLE_CHAT_REQUIRE_MENTION`
+- `GOOGLE_CHAT_BOT_USER`
+- `GOOGLE_CHAT_HTTP_EVENTS_APP_PRINCIPAL`
+
+`GOOGLE_CHAT_ALLOWED_USERS` remains the gateway allowlist.
 
 Install the Google Chat adapter dependencies through its maintained installer.
 It applies the same pinned security floors used by the runtime checks:

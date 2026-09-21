@@ -393,18 +393,30 @@ def _email_verified(claims: Dict[str, Any]) -> bool:
 
 
 def _normalize_gchat_user_id(raw: Optional[str]) -> str:
+    """Bare resource suffix, with the opaque id preserved exactly.
+
+    Only a literal ``users/`` prefix is removed. ``users/AbC`` and ``users/abc``
+    stay different. An email is not a resource id.
+    """
     value = str(raw or "").strip()
-    if value.lower().startswith("users/"):
-        value = value[6:]
-    return value.lower()
+    if "@" in value and not value.startswith("users/"):
+        return value
+    prefix = "users/"
+    if value.startswith(prefix):
+        value = value[len(prefix):]
+    return value
 
 
 def _gchat_user_forms(raw: Optional[str]) -> set[str]:
     value = str(raw or "").strip()
     if not value:
         return set()
+    if "@" in value and not value.startswith("users/"):
+        return {value}
     bare = _normalize_gchat_user_id(value)
-    return {value.lower(), bare, f"users/{bare}"}
+    if not bare:
+        return {value}
+    return {value, bare, f"users/{bare}"}
 
 
 def _gchat_user_matches(candidate: Optional[str], allowed: set[str]) -> bool:
@@ -426,6 +438,19 @@ def _coerce_id_list(raw: Any) -> List[str]:
     else:
         parts = [raw]
     return [str(part).strip() for part in parts if str(part).strip()]
+
+
+def _dm_allow_entries(extra: Any) -> set[str]:
+    """DM allow entries from ``allow_from`` or ``allowFrom``.
+
+    A scalar string is one entry (or a comma-separated list). ``set(scalar)``
+    would turn ``users/123`` into individual characters and reject the sender.
+    """
+    data = extra if isinstance(extra, dict) else {}
+    raw = data.get("allow_from")
+    if raw is None:
+        raw = data.get("allowFrom")
+    return set(_coerce_id_list(raw))
 
 
 def _normalize_gchat_groups(raw: Any) -> Dict[str, Dict[str, Any]]:
@@ -538,16 +563,13 @@ class GoogleChatAdapter(BasePlatformAdapter):
             extra, "http_events_audience", "GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE", self._http_events_url)
         self._http_events_service_account_email = self._str_setting(
             extra, "http_events_service_account_email", "GOOGLE_CHAT_HTTP_EVENTS_SERVICE_ACCOUNT_EMAIL").lower()
-        self._http_events_app_principal = self._str_setting(
-            extra, "http_events_app_principal", "GOOGLE_CHAT_HTTP_EVENTS_APP_PRINCIPAL")
-        self._bot_user = self._str_setting(extra, "bot_user", "GOOGLE_CHAT_BOT_USER")
-        require_mention = extra.get("require_mention")
-        if require_mention is None:
-            require_mention = extra.get("requireMention")
-        if require_mention is None:
-            require_mention = _get_scoped_secret("GOOGLE_CHAT_REQUIRE_MENTION", "") or None
-        self._dm_policy = self._str_setting(extra, "dm_policy", "GOOGLE_CHAT_DM_POLICY").lower()
-        self._group_policy = self._str_setting(extra, "group_policy", "GOOGLE_CHAT_GROUP_POLICY").lower()
+        self._http_events_app_principal = str(_parity_yaml_or_env(
+            extra, "http_events_app_principal", "GOOGLE_CHAT_HTTP_EVENTS_APP_PRINCIPAL") or "").strip()
+        self._bot_user = str(_parity_yaml_or_env(extra, "bot_user", "GOOGLE_CHAT_BOT_USER") or "").strip()
+        require_mention = _parity_yaml_or_env(extra, "require_mention", "GOOGLE_CHAT_REQUIRE_MENTION")
+        self._dm_policy = str(_parity_yaml_or_env(extra, "dm_policy", "GOOGLE_CHAT_DM_POLICY") or "").strip().lower()
+        self._group_policy = str(_parity_yaml_or_env(
+            extra, "group_policy", "GOOGLE_CHAT_GROUP_POLICY") or "").strip().lower()
         self._groups = _normalize_gchat_groups(extra.get("groups"))
         self._source_parity_access = bool(self._dm_policy or self._group_policy or self._groups)
         if self._source_parity_access:
@@ -597,10 +619,26 @@ class GoogleChatAdapter(BasePlatformAdapter):
         return self._groups.get(space_name)
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
-        """Strict DM authorization — pairing does not imply access."""
+        """Strict DM authorization. Pairing does not imply access."""
         if self._dm_policy == "allowlist":
-            return _gchat_user_matches(sender_id, set(self.config.extra.get("allow_from") or []))
+            return _gchat_user_matches(sender_id, _dm_allow_entries(self.config.extra))
         return False
+
+    def _dm_sender_matches(self, sender_name: str, sender_email: str) -> bool:
+        principal = sender_name or sender_email
+        if self._dm_policy in {"", "pairing"}:
+            return bool(principal)
+        if self._dm_policy == "disabled":
+            return False
+        if principal and self._is_dm_allowed(principal):
+            return True
+        return bool(sender_email) and sender_email != principal and self._is_dm_allowed(sender_email)
+
+    def _group_sender_matches(self, chat_id: str, sender_name: str, sender_email: str) -> bool:
+        principal = sender_name or sender_email
+        if self._is_group_sender_allowed(chat_id, principal):
+            return True
+        return bool(sender_email) and sender_email != principal and self._is_group_sender_allowed(chat_id, sender_email)
 
     def _is_dm_intake_allowed(self, sender_id: str) -> bool:
         principal = str(sender_id or "").strip()
@@ -653,7 +691,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
         """Intake gate for source-parity access. Legacy (no dm/group policy) stays open
         so GOOGLE_CHAT_ALLOWED_USERS / gateway pairing keep working unchanged."""
         sender = msg.get("sender") or {}
-        sender_id = sender.get("name") or sender.get("email") or ""
+        sender_name = str(sender.get("name") or "").strip()
+        sender_email = str(sender.get("email") or "").strip()
+        sender_id = sender_name or sender_email
         space_name = space.get("name") or ""
         is_group = self._space_is_group(space)
         if is_group and self._group_requires_mention(space_name) and not self._message_mentions_bot(msg):
@@ -665,11 +705,11 @@ class GoogleChatAdapter(BasePlatformAdapter):
             if not self._is_group_allowed(space_name):
                 logger.debug("[GoogleChat] drop group message (space not allowlisted, space=%s)", space_name)
                 return False
-            if not self._is_group_sender_allowed(space_name, sender_id):
+            if not self._group_sender_matches(space_name, sender_name, sender_email):
                 logger.debug("[GoogleChat] drop group message (sender not allowed, %s)", sender_id)
                 return False
             return True
-        if not self._is_dm_intake_allowed(sender_id):
+        if not self._dm_sender_matches(sender_name, sender_email):
             logger.debug("[GoogleChat] drop DM (dm_policy=%s, sender=%s)", self._dm_policy, sender_id)
             return False
         return True
@@ -1153,8 +1193,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
         space_type = (space.get("type") or space.get("spaceType") or "").upper()
         thread_name = (msg.get("thread") or {}).get("name") or None
         sender = msg.get("sender") or {}
-        sender_name = sender.get("name") or ""
-        sender_email = sender.get("email") or ""
+        sender_name = str(sender.get("name") or "").strip()
+        sender_email = str(sender.get("email") or "").strip()
         # Cache the asker's email per space so _send_file picks the right per-user
         # OAuth token (lower-cased to match the sanitized token-file lookup).
         if sender_email and space_name:
@@ -1841,16 +1881,43 @@ def _is_connected(config: PlatformConfig) -> bool:
 _ENV_SEED_KEYS = (  # (env var, extra key, conv) for seed_extra_from_env
     ("GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE", "http_events_audience", None),
     ("GOOGLE_CHAT_HTTP_EVENTS_SERVICE_ACCOUNT_EMAIL", "http_events_service_account_email", None),
-    ("GOOGLE_CHAT_HTTP_EVENTS_APP_PRINCIPAL", "http_events_app_principal", None),
-    ("GOOGLE_CHAT_BOT_USER", "bot_user", None),
-    ("GOOGLE_CHAT_DM_POLICY", "dm_policy", None),
-    ("GOOGLE_CHAT_GROUP_POLICY", "group_policy", None),
-    ("GOOGLE_CHAT_REQUIRE_MENTION", "require_mention", None),
+    # dm_policy, group_policy, require_mention, bot_user, and http_events_app_principal
+    # are YAML keys under platforms.google_chat.extra. They are not seeded from the
+    # environment, because that update overwrites a configured YAML value. The adapter
+    # still reads those env vars when the YAML key is absent.
     ("GOOGLE_CHAT_MAX_MESSAGES", "max_messages", None),
     ("GOOGLE_CHAT_MAX_BYTES", "max_bytes", None),
     ("GOOGLE_CHAT_BOOTSTRAP_SPACES", "bootstrap_spaces", None),
     ("GOOGLE_CHAT_DEBUG_RAW", "debug_raw", None),
 )
+
+_parity_env_warned: set[str] = set()
+
+
+def _parity_yaml_or_env(extra: Dict[str, Any], key: str, env_name: str) -> Any:
+    """Prefer ``platforms.google_chat.extra[key]``. Env is the deprecated fallback.
+
+    A present YAML value wins, including ``require_mention: false``. A blank string
+    is treated as unset. ``requireMention`` is the camelCase spelling of the same key.
+    """
+    data = extra if isinstance(extra, dict) else {}
+    if key in data:
+        value = data.get(key)
+        if not (isinstance(value, str) and not str(value).strip()):
+            return value
+    if key == "require_mention" and "requireMention" in data:
+        return data.get("requireMention")
+    raw = _get_scoped_secret(env_name, None)
+    if raw is None or not str(raw).strip():
+        return None
+    if env_name not in _parity_env_warned:
+        _parity_env_warned.add(env_name)
+        logger.warning(
+            "%s is deprecated; set platforms.google_chat.extra.%s in config.yaml. "
+            "Using the environment value because that YAML key is absent.",
+            env_name, key,
+        )
+    return raw
 
 
 def _env_enablement() -> Optional[Dict[str, Any]]:

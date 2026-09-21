@@ -156,6 +156,24 @@ def _normalize_nostr_allow_entries(entries: set) -> set:
     return set(entries) | {h for e in entries if e.lower().startswith("npub1") and (h := _npub_to_hex(e))}
 
 
+
+def _google_chat_email_candidate(source) -> Optional[str]:
+    """Email on this Google Chat event, as an email grant rather than a resource alias.
+
+    Parity mode puts the exact ``users/{id}`` on ``user_id`` and the event email on
+    ``user_id_alt``. Only that email is added to the existing Google Chat pairing and
+    allowlist checks. Other platforms do not consult ``user_id_alt`` here, and
+    case-distinct resource ids are not folded together.
+    """
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    if platform != "google_chat":
+        return None
+    alt = str(getattr(source, "user_id_alt", "") or "").strip()
+    if not alt or "@" not in alt or alt.startswith("users/"):
+        return None
+    return alt
+
+
 def _principal_matches_allowlist(source, user_id: str, allowed_ids: set) -> bool:
     """Whether *user_id* (under any platform-specific alias) is in *allowed_ids*."""
     check_ids = {user_id}
@@ -184,6 +202,12 @@ def _principal_matches_allowlist(source, user_id: str, allowed_ids: set) -> bool
         hex_user = _npub_to_hex(user_id) if user_id.startswith("npub") else None
         if hex_user:
             check_ids.add(hex_user)
+    email = _google_chat_email_candidate(source)
+    if email:
+        check_ids.add(email)
+        local = email.split("@", 1)[0]
+        if local:
+            check_ids.add(local)
     return bool(check_ids & allowed_ids)
 
 
@@ -478,7 +502,12 @@ class GatewayAuthorizationMixin:
             adapter = self._authorization_adapter(source.platform, profile=adapter_profile)
             dm_check = getattr(adapter, "_is_dm_allowed", None) if adapter is not None else None
             if callable(dm_check):
-                return bool(dm_check(user_id))
+                if dm_check(user_id):
+                    return True
+                email = _google_chat_email_candidate(source)
+                if email and email != user_id:
+                    return bool(dm_check(email))
+                return False
         return True
 
     def _adapter_extra_allowlist_authorizes(self, source, user_id, is_group) -> bool:
@@ -658,8 +687,14 @@ class GatewayAuthorizationMixin:
         # Pairing store: a first-class grant created only by an operator approving a code. Honored as
         # a UNION with the allowlist (approval also mirrors into it).
         pairing_store = self._pairing_store_for(source)
-        if pairing_store is not None and pairing_store.is_approved(source.platform.value if source.platform else "", user_id):
-            return True
+        if pairing_store is not None:
+            platform_name = source.platform.value if source.platform else ""
+            if pairing_store.is_approved(platform_name, user_id):
+                return True
+            # Same email grant the legacy user_id check used. The resource id is not rewritten.
+            email = _google_chat_email_candidate(source)
+            if email and email != user_id and pairing_store.is_approved(platform_name, email):
+                return True
 
         platform_allowlist = _auth_env(platform_allow_env)
         group_user_allowlist = _auth_env(_GROUP_USER_ENV.get(source.platform, "")) if is_group_or_forum else ""

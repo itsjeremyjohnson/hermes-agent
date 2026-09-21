@@ -1,7 +1,8 @@
 """Google Chat source-parity: app-url HTTP auth, group/DM own-policy, mention, threads.
 
-Does not set GOOGLE_CHAT_ALLOWED_USERS. Group users stay group-only; DMs use pairing
-on the stable users/{id} principal.
+Intake tests leave GOOGLE_CHAT_ALLOWED_USERS unset. Group users stay group-only.
+DMs use pairing on the exact users/{id} principal. Continuity tests authorize the
+event email without treating a different resource id as the same user.
 """
 
 from __future__ import annotations
@@ -79,8 +80,8 @@ def _group_envelope(sender=_USERS[0], space=_SPACE, text="ping", annotations=Non
     return env
 
 
-def _dm_envelope(sender=_USERS[0], text="hello"):
-    env = _make_chat_envelope(text=text, sender_email="alice@example.com")
+def _dm_envelope(sender=_USERS[0], text="hello", *, email="alice@example.com"):
+    env = _make_chat_envelope(text=text, sender_email=email)
     env["chat"]["messagePayload"]["message"]["sender"]["name"] = sender
     return env
 
@@ -424,3 +425,215 @@ class TestReplyToModeAll:
             {"thread_id": "spaces/X/threads/EXPLICIT"},
             chat_id="spaces/X",
         ) == "spaces/X/threads/EXPLICIT"
+
+
+
+def _clear_auth_env(monkeypatch):
+    for key in (
+        "GOOGLE_CHAT_ALLOWED_USERS",
+        "GOOGLE_CHAT_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+        "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_ALLOW_ALL_USERS",
+        "GOOGLE_CHAT_DM_POLICY",
+        "GOOGLE_CHAT_GROUP_POLICY",
+        "GOOGLE_CHAT_REQUIRE_MENTION",
+        "GOOGLE_CHAT_BOT_USER",
+        "GOOGLE_CHAT_HTTP_EVENTS_APP_PRINCIPAL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+def _auth_runner(adapter, store):
+    from gateway.run import GatewayRunner
+    from hermes_cli.plugins import discover_plugins
+
+    discover_plugins()
+    runner = GatewayRunner(GatewayConfig())
+    runner.adapters = {_GC: adapter}
+    runner.pairing_store = store
+    return runner
+
+
+async def _built_dm(adapter, sender, email):
+    env = _dm_envelope(sender=sender, email=email)
+    message = env["chat"]["messagePayload"]["message"]
+    return await adapter._build_message_event(message, env)
+
+
+class TestResourceIdentity:
+    @pytest.mark.asyncio
+    async def test_resource_id_keeps_case(self, parity_adapter):
+        event = await _built_dm(parity_adapter, "users/AbC", "alice@example.com")
+        assert event.source.user_id == "users/AbC"
+        assert event.source.user_id_alt == "alice@example.com"
+        assert getattr(event.source, "role_authorized", False) is not True
+
+
+class TestEmailAuthorizationBoundary:
+    @pytest.mark.asyncio
+    async def test_allowlisted_email_authorizes_exact_resource(self, parity_adapter, monkeypatch, tmp_path):
+        from gateway.pairing import PairingStore
+
+        _clear_auth_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("GOOGLE_CHAT_ALLOWED_USERS", "alice@example.com")
+        event = await _built_dm(parity_adapter, "users/AbC", "alice@example.com")
+        runner = _auth_runner(parity_adapter, PairingStore())
+        assert event.source.user_id == "users/AbC"
+        assert getattr(event.source, "role_authorized", False) is not True
+        assert runner._is_user_authorized(event.source) is True
+
+    @pytest.mark.asyncio
+    async def test_other_email_and_case_distinct_resource_denied(self, parity_adapter, monkeypatch, tmp_path):
+        from gateway.pairing import PairingStore
+
+        _clear_auth_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("GOOGLE_CHAT_ALLOWED_USERS", "users/abc")
+        other = await _built_dm(parity_adapter, "users/AbC", "bob@example.com")
+        bare = await _built_dm(parity_adapter, "users/AbC", "")
+        same = await _built_dm(parity_adapter, "users/abc", "")
+        runner = _auth_runner(parity_adapter, PairingStore())
+        assert runner._is_user_authorized(other.source) is False
+        assert runner._is_user_authorized(bare.source) is False
+        assert runner._is_user_authorized(same.source) is True
+
+    @pytest.mark.asyncio
+    async def test_paired_email_authorizes_only_that_email(self, parity_adapter, monkeypatch, tmp_path):
+        from gateway.pairing import PairingStore
+
+        _clear_auth_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = PairingStore()
+        with store._lock:
+            store._approve_user("google_chat", "alice@example.com", "Alice")
+        paired = await _built_dm(parity_adapter, "users/AbC", "alice@example.com")
+        other = await _built_dm(parity_adapter, "users/AbC", "bob@example.com")
+        resource_only = await _built_dm(parity_adapter, "users/abc", "")
+        runner = _auth_runner(parity_adapter, store)
+        assert store.is_approved("google_chat", "users/AbC") is False
+        assert store.is_approved("google_chat", "alice@example.com") is True
+        assert getattr(paired.source, "role_authorized", False) is not True
+        assert runner._is_user_authorized(paired.source) is True
+        assert runner._is_user_authorized(other.source) is False
+        assert runner._is_user_authorized(resource_only.source) is False
+
+    def test_non_google_alt_email_is_not_an_allowlist_grant(self, monkeypatch, tmp_path):
+        from gateway.pairing import PairingStore
+
+        _clear_auth_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "alice@example.com")
+        runner = _auth_runner(None, PairingStore())
+        runner.adapters = {}
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="1",
+            chat_type="dm",
+            user_id="999",
+            user_id_alt="alice@example.com",
+        )
+        assert runner._is_user_authorized(source) is False
+
+
+class TestDmAllowlistShapes:
+    def _allow_adapter(self, **extra):
+        cfg = _parity_config(dm_policy="allowlist", group_policy="", groups={}, **extra)
+        return GoogleChatAdapter(cfg)
+
+    def test_scalar_allow_from_matches_whole_id(self, monkeypatch, tmp_path):
+        from gateway.pairing import PairingStore
+
+        _clear_auth_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = self._allow_adapter(allow_from="users/123")
+        runner = _auth_runner(adapter, PairingStore())
+        allowed = SessionSource(platform=_GC, chat_id="spaces/DM", chat_type="dm", user_id="users/123")
+        denied = SessionSource(platform=_GC, chat_id="spaces/DM", chat_type="dm", user_id="users/999")
+        character = SessionSource(platform=_GC, chat_id="spaces/DM", chat_type="dm", user_id="u")
+        assert runner._is_user_authorized(allowed) is True
+        assert runner._is_user_authorized(denied) is False
+        assert runner._is_user_authorized(character) is False
+
+    def test_allow_from_camel_case_and_email_scalar(self, monkeypatch, tmp_path):
+        from gateway.pairing import PairingStore
+
+        _clear_auth_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = GoogleChatAdapter(_parity_config(
+            dm_policy="allowlist", group_policy="", groups={}, allow_from=None, allowFrom="alice@example.com",
+        ))
+        # _parity_extra copies overrides after the default groups, then _parity_config
+        # passes them into _base_config. allow_from=None must not block allowFrom.
+        adapter.config.extra.pop("allow_from", None)
+        adapter.config.extra["allowFrom"] = "alice@example.com"
+        runner = _auth_runner(adapter, PairingStore())
+        allowed = SessionSource(
+            platform=_GC, chat_id="spaces/DM", chat_type="dm",
+            user_id="users/AbC", user_id_alt="alice@example.com",
+        )
+        denied = SessionSource(
+            platform=_GC, chat_id="spaces/DM", chat_type="dm",
+            user_id="users/abc", user_id_alt="bob@example.com",
+        )
+        assert runner._is_user_authorized(allowed) is True
+        assert runner._is_user_authorized(denied) is False
+
+
+class TestParityYamlPrecedence:
+    def test_yaml_policy_wins_over_deprecated_env(self, monkeypatch):
+        _clear_auth_env(monkeypatch)
+        monkeypatch.setenv("GOOGLE_CHAT_DM_POLICY", "disabled")
+        monkeypatch.setenv("GOOGLE_CHAT_BOT_USER", "users/from-env")
+        adapter = GoogleChatAdapter(_parity_config(dm_policy="allowlist", bot_user="users/FromYaml"))
+        assert adapter._dm_policy == "allowlist"
+        assert adapter._bot_user == "users/FromYaml"
+
+    def test_env_fallback_when_yaml_key_absent(self, monkeypatch):
+        _clear_auth_env(monkeypatch)
+        monkeypatch.setenv("GOOGLE_CHAT_DM_POLICY", "pairing")
+        cfg = _base_config()
+        adapter = GoogleChatAdapter(cfg)
+        assert adapter._dm_policy == "pairing"
+        assert adapter._source_parity_access is True
+
+    def test_env_seed_does_not_carry_behavior_keys(self, monkeypatch):
+        _clear_auth_env(monkeypatch)
+        monkeypatch.setenv("GOOGLE_CHAT_PROJECT_ID", "p")
+        monkeypatch.setenv("GOOGLE_CHAT_SUBSCRIPTION_NAME", "projects/p/subscriptions/s")
+        monkeypatch.setenv("GOOGLE_CHAT_DM_POLICY", "disabled")
+        monkeypatch.setenv("GOOGLE_CHAT_REQUIRE_MENTION", "false")
+        seed = _gc_mod._env_enablement() or {}
+        assert "dm_policy" not in seed
+        assert "require_mention" not in seed
+        assert "bot_user" not in seed
+        assert "group_policy" not in seed
+        assert "http_events_app_principal" not in seed
+
+    def test_loader_keeps_extra_policy(self, monkeypatch, tmp_path):
+        from gateway.config import load_gateway_config
+
+        _clear_auth_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("GOOGLE_CHAT_DM_POLICY", "disabled")
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  google_chat:\n"
+            "    enabled: true\n"
+            "    extra:\n"
+            "      dm_policy: allowlist\n"
+            "      group_policy: allowlist\n"
+            "      require_mention: true\n"
+            "      groups:\n"
+            "        spaces/KEEPCASE:\n"
+            "          enabled: true\n"
+            "          users:\n"
+            "            - users/AbC\n",
+            encoding="utf-8",
+        )
+        cfg = load_gateway_config()
+        extra = cfg.platforms[_GC].extra
+        assert extra["dm_policy"] == "allowlist"
+        assert extra["groups"]["spaces/KEEPCASE"]["users"] == ["users/AbC"]
