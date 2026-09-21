@@ -775,6 +775,33 @@ class TestSend:
 
 
     @pytest.mark.asyncio
+    async def test_legacy_multi_chunk_send_threads_later_chunks_when_reply_to_mode_first(
+        self, adapter,
+    ):
+        """PlatformConfig defaults reply_to_mode to first. Without source-parity
+        policy that must not unthread later chunks of one send()."""
+        assert adapter._reply_to_mode == "first"
+        assert adapter.enforces_own_access_policy is False
+        adapter._chunk_text = lambda content: ["chunk-one", "chunk-two"]
+        adapter._create_message = AsyncMock(
+            return_value=type("R", (), {"success": True, "message_id": "m/1", "error": None})()
+        )
+
+        result = await adapter.send(
+            "spaces/S",
+            "ignored",
+            metadata={"thread_id": "spaces/S/threads/T"},
+        )
+
+        assert result.success is True
+        assert adapter._create_message.await_count == 2
+        first_body = adapter._create_message.await_args_list[0].args[1]
+        second_body = adapter._create_message.await_args_list[1].args[1]
+        assert first_body.get("thread") == {"name": "spaces/S/threads/T"}
+        assert second_body.get("thread") == {"name": "spaces/S/threads/T"}
+
+
+    @pytest.mark.asyncio
     async def test_with_typing_card_patches_instead_of_creating(self, adapter):
         adapter._typing_messages["spaces/S"] = "spaces/S/messages/THINK"
         adapter._patch_message = AsyncMock(

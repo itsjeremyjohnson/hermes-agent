@@ -480,9 +480,9 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 
 
 from cron.jobs import (
-    _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
-    clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
-    save_job_output, use_cron_store)
+    FireClaimFenceBusy, _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire,
+    fire_claim_fence, clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim,
+    mark_job_run, save_job_output, use_cron_store)
 from cron.executions import (
     _TERMINAL_STATES, create_execution, finish_execution, get_execution,
     mark_execution_handoff_pending, mark_execution_running, recover_interrupted_executions)
@@ -1103,6 +1103,9 @@ def _reclaim_fds_best_effort() -> None:
 def drain_delivery_queue(adapters, loop) -> int:
     """Send queued worker results through this gateway's live adapters."""
     from cron.delivery_queue import _path, drain
+    from cron.error_policy import enqueue_pending_notifications
+
+    enqueue_pending_notifications()
 
     # Only restart-safe workers create the queue file.  Every gateway (macOS,
     # Windows, launchd, Docker) runs this housekeeping tick, so skip the sqlite
@@ -1333,6 +1336,8 @@ def _apply_monitor_gate(
     if not _mon.changed:
         # Unchanged: silent no_change tick (ledger doc kept; SILENT_MARKER blocks delivery).
         logger.info("Job '%s': monitor output unchanged — suppressing agent run", job_id)
+        if job.get("failure_alert_cooldown_seconds") is not None:
+            job["_failure_alert_skipped"] = True
         return (
             True, f"{header}**Status:** no_change (agent run suppressed)\n", SILENT_MARKER, None,
         ), extra_prompt
@@ -1764,6 +1769,8 @@ def _run_agent_with_watchdog(
             return
         if agent is not None and hasattr(agent, "interrupt"):
             agent.interrupt("Cron fire claim ownership was lost")
+        from cron.scheduler_agent_policy import terminal
+        terminal(job, "ownership_lost")
         raise RuntimeError(f"Cron job '{job_name}' lost its durable fire claim ownership")
 
     def _heartbeat_run_claim_if_due():
@@ -1782,8 +1789,9 @@ def _run_agent_with_watchdog(
     _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     # Carry scheduler-scoped ContextVar state (e.g. env passthrough) into the worker thread.
     _cron_context = contextvars.copy_context()
+    from cron.scheduler_agent_policy import run_agent
     _cron_future = _cron_pool.submit(
-        _cron_context.run, agent.run_conversation, prompt, task_id=task_id)
+        _cron_context.run, run_agent, agent, prompt, job, task_id)
     if worker_state is not None:
         worker_state["future"] = _cron_future
     _inactivity_timeout = False
@@ -1841,6 +1849,8 @@ def _run_agent_with_watchdog(
         _raise_inactivity_timeout(agent, job_name, _cron_inactivity_limit)
 
     if not isinstance(result, dict):
+        from cron.scheduler_agent_policy import terminal
+        terminal(job, "invalid_result")
         raise RuntimeError(
             f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
         )
@@ -2019,6 +2029,7 @@ def _prepare_job_prompt(
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
     injection block, empty prompt); otherwise ``prompt`` is set."""
+    job.pop("_failure_alert_skipped", None)
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     if not job.get("no_agent"):
@@ -2057,6 +2068,8 @@ def _prepare_job_prompt(
         prerun_script = _run_job_script_with_claim_heartbeat(job, script_path, cancel_event=cancel_event)
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
+            if job.get("failure_alert_cooldown_seconds") is not None:
+                job["_failure_alert_skipped"] = True
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
@@ -2088,6 +2101,8 @@ def _prepare_job_prompt(
         )
         return (False, blocked_doc, "", str(block_exc)), None
     if prompt is None:
+        if job.get("failure_alert_cooldown_seconds") is not None:
+            job["_failure_alert_skipped"] = True
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return (True, "", SILENT_MARKER, None), None
     return None, prompt
@@ -2320,8 +2335,12 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    from cron import scheduler_agent_policy as agent_policy
+    agent_policy.begin(job)
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
+        if not early[0]:
+            agent_policy.terminal(job, "preflight_rejected")
         return early
     from run_agent import AIAgent
 
@@ -2346,7 +2365,9 @@ def run_job(
         model = jc.model
         setup = _resolve_cron_agent_setup(job, job_id, job_name, jc)
         if setup.blocked is not None:
+            agent_policy.terminal(job, "preflight_rejected")
             return setup.blocked
+        agent_policy.provider(job, (setup.runtime or {}).get("provider"))
         model = setup.model
 
         # Open state.db only after every early-return gate has passed.
@@ -2359,6 +2380,7 @@ def run_job(
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
+        agent_policy.result(job, result, agent)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -2368,6 +2390,7 @@ def run_job(
         return True, output, final_response, None
 
     except Exception as e:
+        agent_policy.exception(job, e, agent)
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # No audit row when we failed before the agent existed; the audit write must never raise.
@@ -2476,6 +2499,12 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                         job_id)
                     return
                 last_confirmed = time.monotonic()
+            except FireClaimFenceBusy:
+                # Same-job OS fence is exclusive: the owner is in delivery/side-effect,
+                # not a dead or replaced claimant. Do not age this into grace.
+                last_confirmed = time.monotonic()
+                logger.debug(
+                    "Job '%s': fire fence busy; deferring claim refresh", job_id)
             except Exception:
                 logger.debug("Job '%s': fire_claim heartbeat failed", job_id, exc_info=True)
                 if (
@@ -2514,6 +2543,9 @@ def run_one_job(
     claim (callers use the store CAS) but keeps it alive. True if processed (a job failure is
     recorded via ``mark_job_run``), False only if processing raised. ``cancel_event``: optional
     transport-level cancel (dashboard drain)."""
+    from cron import interval_schedule, error_policy
+    interval_schedule.validate(job.get("schedule"))
+    error_policy.validate(job)
     # Every gateway path (built-in scheduler, external providers, and direct
     # API fires) crosses this seam.  Ensure the detached worker has a durable
     # attempt to adopt before any launch can occur.
@@ -2708,6 +2740,8 @@ class _RunDelivery:
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
+    failure_alert_outcome: Optional[str] = None
+    skipped: bool = False
 
 
 def _save_compose_deliver(
@@ -2717,6 +2751,9 @@ def _save_compose_deliver(
     """Save output, compose the notice and deliver it (both side effects run under the fire-claim
     fence; a lost claim raises ``_FireClaimLostDuringSideEffect`` for the caller)."""
     job = d.job
+    if job.get("failure_alert_cooldown_seconds") is not None:
+        d.skipped = bool(job.pop("_failure_alert_skipped", False)) or str(d.error or "").startswith(
+            (DRIFT_SKIP_MARKER, DRIFT_SKIP_SILENT_MARKER))
     with fence.side_effect_fence() as owns_output:
         if not owns_output:
             raise _FireClaimLostDuringSideEffect
@@ -2752,6 +2789,21 @@ def _save_compose_deliver(
     if d.should_deliver and fence.lost():
         d.should_deliver = False
         logger.warning("Job '%s': skipping delivery after fire claim ownership loss", job["id"])
+
+    if not d.success and job.get("failure_alert_cooldown_seconds") is not None:
+        from cron import failure_alerts
+
+        suppression = None
+        if d.skipped:
+            suppression = "suppressed_skipped"
+        elif d.incident_acked:
+            suppression = "suppressed_acked"
+        elif not d.should_deliver:
+            suppression = "suppressed"
+        d.delivery_error, d.failure_alert_outcome, d.delivery_attempted = failure_alerts._deliver_cooldown_failure(
+            job, deliver_content, adapters=adapters, loop=loop, suppression=suppression)
+        d.should_deliver = d.delivery_attempted
+        return
 
     if not d.should_deliver:
         return
@@ -2804,17 +2856,28 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery."""
     job = d.job
     mark_kwargs = {"delivery_error": d.delivery_error}
+    from cron import error_policy
+    if error_policy.validate(job):
+        mark_kwargs["error_classification"] = job.get(
+            "_agent_error_classification" if error_policy.agent_selected(job)
+            else "_command_error_classification")
+    if "anchor_ms" in (job.get("schedule") or {}):
+        from cron.executions import get_execution
+        execution = get_execution(execution_id)
+        mark_kwargs["execution_started_at"] = execution.get("started_at") if execution else None
     if fire_owner is not None:
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
+    if d.skipped:
+        mark_kwargs["status"] = "skipped"
     marked = mark_job_run(job["id"], d.success, d.error, **mark_kwargs)
     if fire_owner is not None and not marked:
         finish_execution(
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
         return True
-    delivery_outcome = _classify_delivery_outcome(
+    delivery_outcome = d.failure_alert_outcome or _classify_delivery_outcome(
         delivery_error=d.delivery_error,
         should_deliver=d.should_deliver,
         unresolved_origin=d.unresolved_origin,
@@ -2838,6 +2901,21 @@ def _deliver_crash_failure(
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
+    if job.get("failure_alert_cooldown_seconds") is not None:
+        from cron import failure_alerts
+
+        skipped = str(err_text).startswith((DRIFT_SKIP_MARKER, DRIFT_SKIP_SILENT_MARKER))
+        suppression = None
+        if skipped:
+            suppression = "suppressed_skipped"
+        elif incident_acked:
+            suppression = "suppressed_acked"
+        error, outcome, _attempted = failure_alerts._deliver_cooldown_failure(
+            job, _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
+            adapters=adapters, loop=loop, suppression=suppression)
+        if outcome in ("delivered", "not_configured"):
+            _mark_incident_alerted(failure_incident_id)
+        return error, outcome
     if incident_acked:
         return None, "suppressed_acked"
     delivery_error = None
@@ -2994,6 +3072,8 @@ def _run_one_job_body(
         if d.success and not final_response.strip():
             d.success = False
             d.error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+            from cron.scheduler_agent_policy import terminal
+            terminal(job, "empty_response")
 
         if _consume_interrupted_flag(job["id"], execution_token):
             _finish_interrupted_run(job, execution_id, delivery_error)
@@ -3037,6 +3117,10 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if isinstance(e, Exception):
                     mark_kwargs["delivery_error"] = delivery_error
+                from cron import scheduler_agent_policy as agent_policy
+                agent_policy.exception(job, e, orchestration=True)
+                if agent_policy.agent_selected(job):
+                    mark_kwargs["error_classification"] = job.get("_agent_error_classification")
                 mark_job_run(job["id"], False, _err_text, **mark_kwargs)
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.

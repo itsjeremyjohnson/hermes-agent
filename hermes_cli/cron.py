@@ -179,6 +179,7 @@ def _last_run_display(job: Dict[str, Any]) -> str:
 
 def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
     """``(label, value)`` detail rows for one job in ``cron list``."""
+    from cron.schedule_timezone import schedule_error_message
     # `repeat` / `deliver` may be present-but-null (dict-default only covers a missing key).
     repeat_info = job.get("repeat") or {}
     repeat_times = repeat_info.get("times")
@@ -201,6 +202,7 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
         ("Workdir", job.get("workdir")),
         ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
          if job.get("last_status") else ""),
+        ("Schedule error", schedule_error_message(job)),
         ("Dispatch", _dispatch_display(job.get("last_dispatch"))),
         ("Execution", f"{latest_execution.get('status', '?')}  {latest_execution.get('id', '?')}"
          if latest_execution else "")]

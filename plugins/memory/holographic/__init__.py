@@ -1,7 +1,7 @@
 """hermes-memory-store — holographic memory plugin (MemoryProvider): structured fact storage with entity
 resolution, trust scoring, and HRR-based compositional retrieval. Original plugin by dusterbloom (PR #2351).
 Config in $HERMES_HOME/config.yaml under plugins.hermes-memory-store: db_path ($HERMES_HOME/memory_store.db),
-auto_extract (false), default_trust (0.5), min_trust_threshold (0.3), temporal_decay_half_life (0),
+auto_extract (false), excluded_contexts ([]), default_trust (0.5), min_trust_threshold (0.3), temporal_decay_half_life (0),
 hrr_dim (1024), hrr_weight (0.3)."""
 
 from __future__ import annotations
@@ -102,6 +102,7 @@ class HolographicMemoryProvider(MemoryProvider):
     def __init__(self, config: dict | None = None):
         self._config = config or _load_plugin_config()
         self._store = self._retriever = None
+        self._context_excluded = False
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
 
     @property
@@ -129,11 +130,27 @@ class HolographicMemoryProvider(MemoryProvider):
         return [
             {"key": "db_path", "description": "SQLite database path", "default": f"{display_hermes_home()}/memory_store.db"},
             {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
+            {"key": "excluded_contexts", "description": "Contexts/platforms without memory access (comma-separated, e.g. cron,flush)", "default": ""},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        excluded = self._config.get("excluded_contexts", [])
+        if excluded is None:
+            excluded = []
+        if isinstance(excluded, str):
+            excluded = [context.strip() for context in excluded.split(",") if context.strip()]
+        if not isinstance(excluded, list) or not all(isinstance(context, str) for context in excluded):
+            self._context_excluded = True
+            self.shutdown()
+            raise ValueError("excluded_contexts must be a list of strings or comma-separated string")
+        self._context_excluded = any(kwargs.get(key) in excluded for key in ("agent_context", "platform"))
+        if self._context_excluded:
+            # Toolset gating alone still opens SQLite and permits lifecycle writes.
+            # Close a previous initialization too, so reuse cannot retain manager access.
+            self.shutdown()
+            return
         from hermes_constants import get_hermes_home
         _hermes_home = str(get_hermes_home())
         db_path = self._config.get("db_path", _hermes_home + "/memory_store.db")
@@ -171,9 +188,13 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        if self._context_excluded:
+            return []
         return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        if self._context_excluded:
+            return tool_error("Holographic memory is excluded for this context")
         if tool_name not in self._TOOL_HANDLERS:
             return tool_error(f"Unknown tool: {tool_name}")
         try:

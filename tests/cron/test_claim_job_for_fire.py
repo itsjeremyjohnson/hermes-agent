@@ -263,3 +263,82 @@ def test_same_thread_fire_fence_reentrancy_preserves_ownership(temp_home):
     assert result == {"outer": True, "inner": True}
     thread.join(timeout=2)
     assert thread.is_alive() is False
+
+
+@pytest.fixture
+def plain_cron_runner(temp_home, monkeypatch):
+    """Real job store, script runner, and execution ledger under a controlled clock."""
+    from datetime import datetime, timezone
+
+    from cron import executions, jobs, scheduler
+
+    clock = [datetime(2026, 9, 15, 12, tzinfo=timezone.utc)]
+    for module in (jobs, executions, scheduler):
+        monkeypatch.setattr(module, "_hermes_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", temp_home / "cron" / "executions.db")
+    monkeypatch.setattr(scheduler, "_hermes_home", temp_home)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda job: False)
+    monkeypatch.setattr(scheduler, "_maybe_run_worktree_maintenance", lambda: None)
+    monkeypatch.setattr(scheduler, "_sweep_mcp_orphans", lambda: None)
+
+    effects = temp_home / "effects"
+    script = temp_home / "scripts" / "manual-cron.py"
+    script.parent.mkdir()
+    script.write_text(
+        "from pathlib import Path\n"
+        f"with Path({str(effects)!r}).open('a') as f: f.write('ran\\n')\n"
+        "print('complete')\n"
+    )
+    job = jobs.create_job(
+        None,
+        "0 8 * * *",
+        script=str(script),
+        no_agent=True,
+        deliver="local",
+        name="manual-cron-null",
+    )
+    return jobs, executions, scheduler, clock, effects, job
+
+
+def _run_plain_cron_manually(runner):
+    jobs, executions, scheduler, _clock, _effects, job = runner
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True, manual_run=True)
+    assert isinstance(claimed, dict)
+    assert claimed["_scheduled_instant"] is None
+    assert scheduler.run_one_job(claimed) is True
+    execution = executions.get_execution(claimed["execution_id"])
+    assert execution["status"] == "completed"
+    assert execution["scheduled_instant"] is None
+    return claimed
+
+
+def test_manual_run_claim_binds_no_scheduled_instant_on_plain_cron(plain_cron_runner):
+    """A manual plain-cron run leaves its future scheduled occurrence available."""
+    jobs, _executions, _scheduler, _clock, effects, job = plain_cron_runner
+    scheduled = job["next_run_at"]
+
+    _run_plain_cron_manually(plain_cron_runner)
+
+    assert jobs.get_job(job["id"])["next_run_at"] == scheduled
+    assert effects.read_text().splitlines() == ["ran"]
+
+
+def test_scheduled_tick_after_manual_run_binds_plain_cron_instant(plain_cron_runner):
+    """The preserved future occurrence still runs once with its scheduled identity."""
+    from datetime import datetime
+
+    from cron.occurrences import scheduled_instant
+
+    jobs, executions, scheduler, clock, effects, job = plain_cron_runner
+    scheduled = job["next_run_at"]
+    manual = _run_plain_cron_manually(plain_cron_runner)
+
+    clock[0] = datetime.fromisoformat(scheduled)
+    assert scheduler.tick(verbose=False, sync=True) == 1
+
+    rows = executions.list_executions(job_id=job["id"])
+    regular = next(row for row in rows if row["id"] != manual["execution_id"])
+    assert regular["status"] == "completed"
+    assert regular["scheduled_instant"] == scheduled_instant(scheduled)
+    assert effects.read_text().splitlines() == ["ran", "ran"]
+    assert jobs.get_job(job["id"])["next_run_at"] != scheduled

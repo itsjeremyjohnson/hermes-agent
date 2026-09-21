@@ -25,8 +25,15 @@ Config in `config.yaml` under `plugins.hermes-memory-store`:
 |-----|---------|-------------|
 | `db_path` | `$HERMES_HOME/memory_store.db` | SQLite database path |
 | `auto_extract` | `false` | Auto-extract facts at session end |
+| `excluded_contexts` | `[]` | Contexts or platforms that must not open, read, or write this store; YAML list or comma-separated string |
 | `default_trust` | `0.5` | Default trust score for new facts |
 | `hrr_dim` | `1024` | HRR vector dimensions |
+
+For manager-only storage, set `excluded_contexts: [cron, flush]` and keep
+`auto_extract: false`. Excluded sessions do not initialize SQLite, expose memory
+tools, or run recall/extraction. Explicit manager `fact_store` calls remain
+available. This setting does not change cron skills or built-in `MEMORY.md`
+configuration. Delegated subagents already skip external memory providers.
 
 ## Tools
 

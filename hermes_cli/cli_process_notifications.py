@@ -1,10 +1,80 @@
 """CLI notification ownership, structured queueing and last-moment consumption."""
 
 
+def quiet_results_with_manager_completions(cli, result):
+    """Keep canonical manager one-shots alive for their existing completion queue."""
+    import queue
+    import time
+
+    from tools.bot_mode_dm import message_agent_authorized
+    from tools.interrupt import is_interrupted
+    from tools.process_registry import process_registry
+    from tools.process_registry_notifications import ProcessNotificationBatch
+
+    yield result
+    if (getattr(cli.agent, "_bot_mode_manager", False) is not True
+            or not message_agent_authorized(cli.agent)):
+        return
+    budget = process_registry._oneshot_completion_wait_seconds()
+    if budget <= 0:
+        return
+    # Share the existing exit-linger budget; finalization must not wait it twice.
+    cli._oneshot_completion_deadline = time.monotonic() + budget
+    while not (isinstance(result, dict) and result.get("failed")):
+        if is_interrupted():
+            raise KeyboardInterrupt
+        if isinstance(result, dict):
+            cli.conversation_history = result.get("messages", cli.conversation_history)
+        # Snapshot BEFORE draining. A finished process can still be publishing its
+        # notification; its completion event is set only after queue publication.
+        pending = []
+        for item in process_registry.list_sessions():
+            process = process_registry.get(item["session_id"])
+            if (process is not None and process.notify_on_complete
+                    and not process._completion_event.is_set()
+                    and cli._owns_process_notification({"type": "completion", "session_id": process.id,
+                                                       "session_key": process.session_key})):
+                pending.append(process)
+        cli._drain_process_notifications("cli-oneshot-manager")
+        try:
+            notification = cli._pending_input.get_nowait()
+        except queue.Empty:
+            notification = None
+        if notification is not None:
+            if not isinstance(notification, ProcessNotificationBatch):
+                cli._pending_input.put(notification)
+                return
+            message = notification.render(process_registry)
+            if message:
+                result = cli.agent.run_conversation(
+                    user_message=message, conversation_history=cli.conversation_history,
+                )
+                yield result
+            continue
+        if not pending:
+            return
+        remaining = cli._oneshot_completion_deadline - time.monotonic()
+        if remaining <= 0:
+            yield {"failed": True, "error": "Manager completion wait expired before worker review",
+                   "messages": cli.conversation_history, "final_response": ""}
+            return
+        # A short event wait lets a fast sibling's notification wake the next turn
+        # without waiting for the first/slowest process to finish.
+        pending[0]._completion_event.wait(min(remaining, 0.1))
+
+
 class CLIProcessNotificationsMixin:
     def _owns_process_notification(self, event: dict) -> bool:
         """Whether this session owns a delegation event (pre-compression keys resolve to their continuation; fail closed)."""
         event_key = str(event.get("session_key") or "")
+        if event.get("type", "completion") == "completion" and event.get("session_id"):
+            from tools.process_registry import process_registry
+
+            process = process_registry.get(event["session_id"])
+            if process is not None and process.parent_session_id:
+                # CLI tools use a turn UUID for session_key. The spawning stored
+                # conversation is the durable owner, including after compression.
+                event_key = process.parent_session_id
         current_key = str(getattr(self, "session_id", "") or "")
         if not event_key or not current_key:
             return False
@@ -58,4 +128,3 @@ class CLIProcessNotificationsMixin:
         if is_seeded_query:
             user_input = (user_input.text, user_input.images) if user_input.images else user_input.text
         return user_input, is_voice_input, is_seeded_query
-

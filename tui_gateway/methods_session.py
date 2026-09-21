@@ -656,6 +656,11 @@ def _resume_response(
     status: str = "idle", hydrating: bool | None = None, started_at=None, auto_continue=None,
 ) -> dict:
     """Common resume payload; omit_messages counts ``count_source`` (client still learns the stored size)."""
+    # A cold resume can schedule recovery before its agent build finishes.
+    # Persisted user text alone must not look like a completed turn to pollers.
+    if record.get("_auto_continue_scheduled"):
+        running = True
+        status = "working" if record.get("running") else "starting"
     if messages is None:
         messages = ctx.messages(display)
     if message_count is None:
@@ -1938,6 +1943,24 @@ def _(rid, params: dict, session: dict) -> dict:
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
     _tts_stream_stop()  # keypress barge-in also silences streaming TTS (voice is process-global)
+    by_stored_id = "stored_session_id" in params
+    if by_stored_id:
+        stored = params["stored_session_id"]
+        profile = params.get("profile")
+        if (not isinstance(stored, str) or not stored.strip() or "session_id" in params
+                or not isinstance(profile, str) or not profile.strip()):
+            return _err(rid, 4002, "stored_session_id requires an explicit profile and no runtime session_id")
+        try:
+            home = _profile_home(profile)
+        except (FileNotFoundError, ValueError):
+            return _err(rid, 4002, "profile not found")
+        # A stop must never resume a durable conversation: resume may start
+        # crash recovery. Resolve only an already-live, profile-owned runtime.
+        with _sessions_lock:
+            live = _find_live_session_by_key(stored, home)
+        if live is None:
+            return _err(rid, 4001, "live session not found in requested profile")
+        params = {**params, "session_id": live[0]}
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -1953,9 +1976,10 @@ def _(rid, params: dict) -> dict:
         except Exception as exc:
             return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
-    session, err = _sess(params, rid)
-    if err:
-        return err
+    if not by_stored_id:
+        session, err = _sess(params, rid)
+        if err:
+            return err
     _interrupt_session_turn(sid, session)
     # Retire the crash-recovery marker NOW: until the run thread's finally, a backend exit looks like a crash
     # and session.resume auto-continues the turn the user just stopped (the extra key covers compression

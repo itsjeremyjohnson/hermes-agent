@@ -345,6 +345,7 @@ _FORMAT_JOB_OPTIONAL_KEYS = (
 
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     from agent.redact import redact_sensitive_text
+    from cron.schedule_timezone import schedule_error_message
 
     prompt = str(job.get("prompt") or "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
@@ -377,6 +378,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
     }
+    if schedule_error := schedule_error_message(job):
+        result["schedule_error"] = schedule_error
     for key in _FORMAT_JOB_OPTIONAL_KEYS:
         if job.get(key):
             result[key] = True if key == "no_agent" else job[key]

@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from cron.jobs import _ensure_cron_dir
+from cron.jobs import _ensure_cron_dir, _normalize_script_limit
 from pathlib import Path
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -313,9 +313,95 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
     return [python_exe, str(path)], env_overlay, None
 
 
+def _collect_bounded_script_output(
+    proc: subprocess.Popen, timeout: int, max_bytes: int,
+    cancel_event: Optional[_CancelEventLike],
+    failure_classification: Optional[dict] = None,
+) -> tuple[bytes, bytes, Optional[str]]:
+    """Drain both binary pipes, retaining the last ``max_bytes`` bytes of each stream.
+
+    Nonblocking readers stop even if an already-reparented descendant retains a pipe. Only
+    the execution thread owns tree cleanup. Tail capture never changes the script's exit status.
+    Platforms without nonblocking pipe support fail closed when an output cap is requested.
+    """
+    chunks = [bytearray(), bytearray()]
+    stop_readers = threading.Event()
+    failed = threading.Event()
+    finished = [threading.Event(), threading.Event()]
+
+    def read_pipe(index, stream):
+        try:
+            while not stop_readers.is_set():
+                try:
+                    data = os.read(stream.fileno(), min(4096, max_bytes))
+                except BlockingIOError:
+                    stop_readers.wait(0.02)
+                    continue
+                if not data:
+                    break
+                # Each reader owns one buffer. Trim before extending so retained
+                # payload never exceeds the per-stream cap, even during a large write.
+                excess = len(chunks[index]) + len(data) - max_bytes
+                if excess > 0:
+                    del chunks[index][:excess]
+                chunks[index].extend(data)
+        except OSError:
+            failed.set()
+        finally:
+            finished[index].set()
+
+    readers = []
+    error = None
+    deadline = time.monotonic() + timeout
+    try:
+        for index, stream in enumerate((proc.stdout, proc.stderr)):
+            os.set_blocking(stream.fileno(), False)
+            reader = threading.Thread(target=read_pipe, args=(index, stream),
+                                      name=f"cron-script-output-{proc.pid}-{index}", daemon=True)
+            reader.start()
+            readers.append(reader)
+        while True:
+            if failed.is_set():
+                error = "Script output could not be read"
+            elif cancel_event is not None and cancel_event.is_set():
+                error = "Script cancelled because cron fire ownership was lost"
+            elif time.monotonic() >= deadline:
+                error = f"Script timed out after {timeout}s"
+                if failure_classification is not None:
+                    failure_classification.update(kind="reason", reason="timeout")
+            elif all(event.is_set() for event in finished) and proc.poll() is not None:
+                break
+            if error is not None:
+                break
+            stop_readers.wait(0.02)
+    except Exception:
+        error = "Script output collection failed"
+        raise
+    finally:
+        stop_readers.set()
+        if error is not None:
+            _terminate_cron_script_tree(proc)
+            # A completed leader may still have descendants holding the pipes open. Every
+            # script starts its own session; its surviving POSIX group remains ours to stop.
+            if proc.returncode is not None and sys.platform != "win32":
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+        for reader in readers:
+            reader.join(timeout=1.0)
+        for stream in (proc.stdout, proc.stderr):
+            with contextlib.suppress(OSError):
+                stream.close()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=1.0)
+    return bytes(chunks[0]), bytes(chunks[1]), error
+
+
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    *, script_timeout_seconds: Optional[int] = None,
+    script_max_output_bytes: Optional[int] = None,
+    failure_classification: Optional[dict] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -327,16 +413,26 @@ def _run_job_script(
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
     instead of the scripts-dir parent. See #69396.
     """
+    classification = failure_classification if failure_classification is not None else {}
+    classification.clear()
+    classification["kind"] = "permanent"
+    try:
+        script_timeout = _normalize_script_limit(script_timeout_seconds, "script_timeout_seconds")
+        max_bytes = _normalize_script_limit(script_max_output_bytes, "script_max_output_bytes")
+    except ValueError as exc:
+        return False, str(exc)
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
-    script_timeout = _get_script_timeout()
+    if script_timeout is None:
+        script_timeout = _get_script_timeout()
     argv, env_overlay, err = _script_argv(path)
     if argv is None:
         return False, err
 
+    classification.clear()
     try:
-        from tools.environments.local import build_subprocess_env
+        from cron.script_environment import build_cron_script_env
         popen_kwargs: dict[str, Any] = {"start_new_session": True}
         if sys.platform == "win32":
             popen_kwargs = {
@@ -348,17 +444,28 @@ def _run_job_script(
                 # reader threads on non-UTF-8 Windows (#45099).
                 "encoding": "utf-8",
                 "errors": "replace"}
-        env = build_subprocess_env()
+        env = build_cron_script_env()
         env.update(env_overlay)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
         # gateway sessions (#69396).
+        if max_bytes is not None:
+            popen_kwargs.pop("encoding", None)
+            popen_kwargs.pop("errors", None)
+            popen_kwargs["bufsize"] = 0
         proc = subprocess.Popen(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=max_bytes is None,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
+        if max_bytes is not None:
+            stdout_bytes, stderr_bytes, err = _collect_bounded_script_output(
+                proc, script_timeout, max_bytes, cancel_event, failure_classification=classification)
+            if err is not None:
+                return False, err
+            stdout_raw = stdout_bytes.decode("utf-8", errors="replace")
+            stderr_raw = stderr_bytes.decode("utf-8", errors="replace")
         deadline = time.monotonic() + script_timeout
-        while True:
+        while max_bytes is None:
             # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
             # backgrounded shell jobs); kill_process_tree snapshots descendants BEFORE signalling.
             if cancel_event is not None and cancel_event.is_set():
@@ -375,6 +482,7 @@ def _run_job_script(
                 # / #59549). agent.deadline.kill_process_tree snapshots the descendant set via psutil BEFORE
                 # signalling, so own-session grandchildren are reached too — the unified deadline layer's
                 # tree-kill (#85147, d6a5cb9725).
+                classification.update(kind="reason", reason="timeout")
                 return False, f"Script timed out after {script_timeout}s: {path}"
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
@@ -395,6 +503,7 @@ def _run_job_script(
             stdout = stderr = "[REDACTED - redaction failed]"
 
         if proc.returncode != 0:
+            classification["kind"] = "permanent"
             parts = [f"Script exited with code {proc.returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
@@ -403,6 +512,8 @@ def _run_job_script(
             return False, "\n".join(parts)
         return True, stdout
     except Exception as exc:
+        if isinstance(exc, FileNotFoundError):
+            classification["kind"] = "permanent"
         return False, f"Script execution failed: {exc}"
 
 
@@ -429,10 +540,16 @@ def _run_job_script_with_claim_heartbeat(
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from the
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     schedule = job.get("schedule")
+    limits = {key: job[key] for key in ("script_timeout_seconds", "script_max_output_bytes")
+              if key in job}
+    from cron import error_policy
+    if error_policy.validate(job) and not error_policy.agent_selected(job):
+        job["_command_error_classification"] = {}
+        limits["failure_classification"] = job["_command_error_classification"]
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     if not (isinstance(schedule, dict) and schedule.get("kind") == "once" and owner):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, **limits)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -450,10 +567,10 @@ def _run_job_script_with_claim_heartbeat(
             "Job '%s': could not start script run_claim heartbeat", job_id, exc_info=True),
     )
     if heartbeat_thread is None:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, **limits)
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, **limits)
     finally:
         stop.set()
         # Bounded join: the heartbeat may be blocked on another process's jobs-file lock.

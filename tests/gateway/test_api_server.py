@@ -322,6 +322,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
         "/api/platforms/{platform}/events",
         adapter._handle_platform_event_callback,
     )
+    for method, path, handler in adapter._platform_event_alias_route_table():
+        app.router.add_route(method, path, handler)
+    if adapter.gateway_runner is not None:
+        app["gateway_runner"] = adapter.gateway_runner
     return app
 
 
@@ -1901,6 +1905,20 @@ class TestSendMethod:
         assert "HTTP request/response" in result.error
 
 
+def _make_alias_adapter(routes, *, key="test-api-server-key-ok"):
+    return APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "host": "127.0.0.1",
+                "port": 0,
+                "key": key,
+                "platform_event_routes": routes,
+            },
+        )
+    )
+
+
 class TestPlatformEventCallbackEndpoint:
 
     @pytest.mark.asyncio
@@ -1923,6 +1941,147 @@ class TestPlatformEventCallbackEndpoint:
 
         assert resp.status == 401
         assert body["error"]["code"] == "invalid_google_bearer"
+
+    @pytest.mark.asyncio
+    async def test_legacy_platform_events_path_still_dispatches(self, adapter):
+        fake = _FakeGoogleChatAdapter()
+        app = _create_app(adapter)
+        app["platform_event_adapters"] = {"google_chat": fake}
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/platforms/google_chat/events",
+                headers={"Authorization": "Bearer good"},
+                json={"type": "MESSAGE", "text": "hi"},
+            )
+            body = await resp.json()
+
+        assert resp.status == 200
+        assert body == {"ok": True}
+        assert fake.dispatched == [{"type": "MESSAGE", "text": "hi"}]
+
+
+class TestPlatformEventRouteAliases:
+    def test_reserved_alias_fails_before_listener_starts(self, monkeypatch):
+        monkeypatch.delenv("API_SERVER_KEY", raising=False)
+        adapter = _make_alias_adapter({"/v1/models": "google_chat"})
+        assert adapter._platform_event_routes_error
+        assert adapter._site is None
+        assert adapter._runner is None
+
+    def test_non_mapping_alias_fails_before_listener_starts(self, monkeypatch):
+        monkeypatch.delenv("API_SERVER_KEY", raising=False)
+        adapter = _make_alias_adapter(["/googlechat"])
+        assert adapter._platform_event_routes_error
+        assert "mapping" in adapter._platform_event_routes_error
+
+    def test_nested_profile_mapping_is_rejected(self, monkeypatch):
+        monkeypatch.delenv("API_SERVER_KEY", raising=False)
+        adapter = _make_alias_adapter({
+            "/googlechat": {"platform": "google_chat", "profile": "specialist"},
+        })
+        assert adapter._platform_event_routes_error
+        assert "platform name string" in adapter._platform_event_routes_error
+
+    @pytest.mark.asyncio
+    async def test_invalid_alias_connect_is_non_retryable_and_does_not_bind(self, monkeypatch):
+        monkeypatch.delenv("API_SERVER_KEY", raising=False)
+        adapter = _make_alias_adapter({"/health": "google_chat"})
+        try:
+            assert await adapter.connect() is False
+            assert adapter.has_fatal_error is True
+            assert adapter.fatal_error_retryable is False
+            assert adapter.fatal_error_code == "api_server_platform_event_routes_invalid"
+            assert adapter._site is None
+            assert adapter._runner is None
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_unsigned_alias_is_rejected(self):
+        default = _FakeGoogleChatAdapter(verify_ok=False, verify_code="missing_google_bearer")
+        adapter = _make_alias_adapter({"/googlechat": "google_chat"})
+        adapter.gateway_runner = types.SimpleNamespace(
+            adapters={Platform("google_chat"): default},
+            _profile_adapters={"specialist": {Platform("google_chat"): _FakeGoogleChatAdapter()}},
+        )
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/googlechat", json={"type": "MESSAGE"})
+            body = await resp.json()
+
+        assert resp.status == 401
+        assert body["error"]["code"] == "missing_google_bearer"
+        assert default.dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_bad_bearer_alias_is_rejected(self):
+        default = _FakeGoogleChatAdapter(verify_ok=False, verify_code="invalid_google_bearer")
+        adapter = _make_alias_adapter({"/googlechat": "google_chat"})
+        adapter.gateway_runner = types.SimpleNamespace(
+            adapters={Platform("google_chat"): default},
+            _profile_adapters={},
+        )
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/googlechat",
+                headers={"Authorization": "Bearer bad"},
+                json={"type": "MESSAGE"},
+            )
+            body = await resp.json()
+
+        assert resp.status == 401
+        assert body["error"]["code"] == "invalid_google_bearer"
+        assert default.dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_alias_dispatches_only_default_google_adapter(self):
+        default = _FakeGoogleChatAdapter()
+        specialist = _FakeGoogleChatAdapter()
+        adapter = _make_alias_adapter({"/googlechat": "google_chat"})
+        adapter.gateway_runner = types.SimpleNamespace(
+            adapters={Platform("google_chat"): default},
+            _profile_adapters={"specialist": {Platform("google_chat"): specialist}},
+        )
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/googlechat",
+                headers={"Authorization": "Bearer good"},
+                json={"type": "MESSAGE", "text": "hola"},
+            )
+            body = await resp.json()
+
+        assert resp.status == 200
+        assert body == {"ok": True}
+        assert default.dispatched == [{"type": "MESSAGE", "text": "hola"}]
+        assert specialist.dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_alias_does_not_fall_back_to_specialist_adapter(self):
+        specialist = _FakeGoogleChatAdapter()
+        adapter = _make_alias_adapter({"/googlechat": "google_chat"})
+        adapter.gateway_runner = types.SimpleNamespace(
+            adapters={},
+            _profile_adapters={"specialist": {Platform("google_chat"): specialist}},
+        )
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/googlechat",
+                headers={"Authorization": "Bearer good"},
+                json={"type": "MESSAGE"},
+            )
+            body = await resp.json()
+
+        assert resp.status == 503
+        assert body["error"]["code"] == "platform_unavailable"
+        assert specialist.dispatched == []
 
 
 # ---------------------------------------------------------------------------

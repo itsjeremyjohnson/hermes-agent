@@ -136,6 +136,11 @@ _SUBSCRIPTION_PATH_RE = re.compile(r"^projects/(?P<project>[^/]+)/subscriptions/
 # chat.bot covers the bot's own messaging ops; it CANNOT call media.upload
 # (user OAuth required — see ``oauth.py``).
 _CHAT_SCOPES = ["https://www.googleapis.com/auth/chat.bot", "https://www.googleapis.com/auth/pubsub"]
+# Direct Chat app-url tokens (OpenClaw googlechat auth.ts). Relay-email mode keeps a configured
+# service-account email list; app-url mode is opt-in via http_events_app_principal.
+_CHAT_ISSUER_EMAIL = "chat@system.gserviceaccount.com"
+_ADDON_ISSUER_PATTERN = re.compile(r"^service-\d+@gcp-sa-gsuiteaddons\.iam\.gserviceaccount\.com$")
+_TRUTHY_SETTING = {"1", "true", "yes", "on"}
 _MAX_TEXT_LENGTH = 4000  # Chat limit is 4096; leave margin.
 _RATE_LIMIT_WARN_THRESHOLD = 5
 # Bounded outbound retry for transient 429/5xx so a true outage surfaces quickly.
@@ -341,6 +346,114 @@ def _create_kwargs(chat_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
+def _truthy_setting(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in _TRUTHY_SETTING
+
+
+def _normalize_reply_to_mode(raw: Any, default: str = "first") -> str:
+    """YAML 1.1 parses bare ``off`` as False. Do not use ``or`` (that maps False → first)."""
+    if raw is None:
+        return default
+    if raw is False:
+        return "off"
+    mode = str(raw).strip().lower()
+    return mode if mode in {"off", "first", "all"} else default
+
+
+def _email_verified(claims: Dict[str, Any]) -> bool:
+    """OIDC email_verified is a boolean. Accept only True or the JWT string ``true``."""
+    verified = claims.get("email_verified")
+    return verified is True or verified == "true"
+
+
+def _normalize_gchat_user_id(raw: Optional[str]) -> str:
+    value = str(raw or "").strip()
+    if value.lower().startswith("users/"):
+        value = value[6:]
+    return value.lower()
+
+
+def _gchat_user_forms(raw: Optional[str]) -> set[str]:
+    value = str(raw or "").strip()
+    if not value:
+        return set()
+    bare = _normalize_gchat_user_id(value)
+    return {value.lower(), bare, f"users/{bare}"}
+
+
+def _gchat_user_matches(candidate: Optional[str], allowed: set[str]) -> bool:
+    if not candidate or not allowed:
+        return False
+    allowed_forms: set[str] = set()
+    for entry in allowed:
+        allowed_forms.update(_gchat_user_forms(entry))
+    return bool(_gchat_user_forms(candidate) & allowed_forms)
+
+
+def _coerce_id_list(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        parts = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        parts = list(raw)
+    else:
+        parts = [raw]
+    return [str(part).strip() for part in parts if str(part).strip()]
+
+
+def _normalize_gchat_groups(raw: Any) -> Dict[str, Dict[str, Any]]:
+    """Translate config ``groups.<space>.users`` into adapter-owned allow_from for the
+    gateway own-policy helper (``authz_mixin._adapter_group_has_sender_allowlist``)."""
+    if not isinstance(raw, dict):
+        return {}
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for space, cfg in raw.items():
+        space_id = str(space or "").strip()
+        if not space_id:
+            continue
+        entry = cfg if isinstance(cfg, dict) else {}
+        users = _coerce_id_list(entry.get("users") or entry.get("allow_from") or entry.get("allowFrom"))
+        mention = entry.get("require_mention")
+        if mention is None:
+            mention = entry.get("requireMention")
+        normalized[space_id] = {
+            "enabled": _truthy_setting(entry.get("enabled"), True),
+            "allow_from": users,
+            "users": users,
+            "require_mention": None if mention is None else _truthy_setting(mention),
+        }
+    return normalized
+
+
+def _http_event_identity_allowed(
+    claims: Dict[str, Any], *, app_principal: str, configured_emails: set[str],
+) -> Tuple[bool, str]:
+    """App-principal mode accepts only Chat's app-url issuers (chat@system or addon+sub).
+    Relay-email matching is used only when app_principal is unset."""
+    if not _email_verified(claims):
+        return False, "google_email_not_verified"
+    email = str(claims.get("email") or "").strip().lower()
+    if not email:
+        return False, "unexpected_google_bearer_identity"
+    if app_principal:
+        if email == _CHAT_ISSUER_EMAIL:
+            return True, ""
+        if _ADDON_ISSUER_PATTERN.match(email):
+            token_principal = str(claims.get("sub") or "").strip()
+            if token_principal and token_principal == app_principal:
+                return True, ""
+            return False, "unexpected_google_addon_principal"
+        return False, "invalid_google_chat_issuer"
+    if configured_emails and email in configured_emails:
+        return True, ""
+    return False, "unexpected_google_bearer_identity"
+
+
 class GoogleChatAdapter(BasePlatformAdapter):
     """Google Chat bot adapter: Pub/Sub pull (or HTTP callbacks) + Chat REST API. Env vars
     are documented in gateway/config.py (GOOGLE_CHAT_PROJECT_ID, GOOGLE_CHAT_SUBSCRIPTION_NAME,
@@ -401,6 +514,35 @@ class GoogleChatAdapter(BasePlatformAdapter):
             extra, "http_events_audience", "GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE", self._http_events_url)
         self._http_events_service_account_email = self._str_setting(
             extra, "http_events_service_account_email", "GOOGLE_CHAT_HTTP_EVENTS_SERVICE_ACCOUNT_EMAIL").lower()
+        self._http_events_app_principal = self._str_setting(
+            extra, "http_events_app_principal", "GOOGLE_CHAT_HTTP_EVENTS_APP_PRINCIPAL")
+        self._bot_user = self._str_setting(extra, "bot_user", "GOOGLE_CHAT_BOT_USER")
+        require_mention = extra.get("require_mention")
+        if require_mention is None:
+            require_mention = extra.get("requireMention")
+        if require_mention is None:
+            require_mention = _get_scoped_secret("GOOGLE_CHAT_REQUIRE_MENTION", "") or None
+        self._dm_policy = self._str_setting(extra, "dm_policy", "GOOGLE_CHAT_DM_POLICY").lower()
+        self._group_policy = self._str_setting(extra, "group_policy", "GOOGLE_CHAT_GROUP_POLICY").lower()
+        self._groups = _normalize_gchat_groups(extra.get("groups"))
+        self._source_parity_access = bool(self._dm_policy or self._group_policy or self._groups)
+        if self._source_parity_access:
+            if not self._dm_policy:
+                self._dm_policy = "pairing"
+            if not self._group_policy:
+                self._group_policy = "allowlist"
+            self._require_mention = True if require_mention is None else _truthy_setting(require_mention)
+        else:
+            self._require_mention = _truthy_setting(require_mention)
+        raw_mode = getattr(self.config, "reply_to_mode", None)
+        if raw_mode is None:
+            raw_mode = extra.get("reply_to_mode")
+        self._reply_to_mode = _normalize_reply_to_mode(raw_mode)
+
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        """Parity mode gates group/DM access at intake via dm_policy/group_policy."""
+        return self._source_parity_access
 
     @staticmethod
     def _int_setting(extra: Dict[str, Any], key: str, env_name: str, default: int) -> int:
@@ -412,6 +554,114 @@ class GoogleChatAdapter(BasePlatformAdapter):
     @staticmethod
     def _str_setting(extra: Dict[str, Any], key: str, env_name: str, fallback: str = "") -> str:
         return (extra.get(key) or _get_scoped_secret(env_name, "") or fallback).strip()
+
+    def _configured_http_emails(self) -> set[str]:
+        return {item.strip().lower() for item in self._http_events_service_account_email.split(",") if item.strip()}
+
+    def _mention_targets(self) -> set[str]:
+        targets = {"users/app", "app"}
+        for raw in (self._bot_user, self._bot_user_id):
+            targets.update(_gchat_user_forms(raw))
+        return {item for item in targets if item}
+
+    def _space_is_group(self, space: Dict[str, Any]) -> bool:
+        space_type = str(space.get("type") or space.get("spaceType") or "").upper()
+        return space_type not in {"DIRECT_MESSAGE", "DM"}
+
+    def _group_entry(self, space_name: str) -> Optional[Dict[str, Any]]:
+        # Space resource names are opaque and case-sensitive; no case-fold fallback.
+        return self._groups.get(space_name)
+
+    def _is_dm_allowed(self, sender_id: str) -> bool:
+        """Strict DM authorization — pairing does not imply access."""
+        if self._dm_policy == "allowlist":
+            return _gchat_user_matches(sender_id, set(self.config.extra.get("allow_from") or []))
+        return False
+
+    def _is_dm_intake_allowed(self, sender_id: str) -> bool:
+        principal = str(sender_id or "").strip()
+        if not principal:
+            return False
+        if self._dm_policy in {"", "pairing"}:
+            return True
+        if self._dm_policy == "disabled":
+            return False
+        return self._is_dm_allowed(principal)
+
+    def _is_group_allowed(self, chat_id: str) -> bool:
+        if self._group_policy == "disabled":
+            return False
+        if self._group_policy != "allowlist":
+            return True
+        entry = self._group_entry(chat_id)
+        return bool(entry and entry.get("enabled"))
+
+    def _is_group_sender_allowed(self, chat_id: str, sender_id: str) -> bool:
+        entry = self._group_entry(chat_id)
+        if not entry:
+            return self._group_policy != "allowlist"
+        allowed = set(entry.get("allow_from") or [])
+        if not allowed:
+            return False
+        return _gchat_user_matches(sender_id, allowed)
+
+    def _message_mentions_bot(self, msg: Dict[str, Any]) -> bool:
+        targets = self._mention_targets()
+        for annotation in msg.get("annotations") or []:
+            if not isinstance(annotation, dict):
+                continue
+            if str(annotation.get("type") or "").upper() != "USER_MENTION":
+                continue
+            mention = annotation.get("userMention") or annotation.get("user_mention") or {}
+            user = mention.get("user") or {}
+            name = user.get("name") or mention.get("name") or ""
+            if _gchat_user_forms(name) & targets:
+                return True
+        return False
+
+    def _group_requires_mention(self, space_name: str) -> bool:
+        entry = self._group_entry(space_name)
+        if entry and entry.get("require_mention") is not None:
+            return bool(entry.get("require_mention"))
+        return self._require_mention
+
+    def _should_accept_inbound(self, msg: Dict[str, Any], space: Dict[str, Any]) -> bool:
+        """Intake gate for source-parity access. Legacy (no dm/group policy) stays open
+        so GOOGLE_CHAT_ALLOWED_USERS / gateway pairing keep working unchanged."""
+        sender = msg.get("sender") or {}
+        sender_id = sender.get("name") or sender.get("email") or ""
+        space_name = space.get("name") or ""
+        is_group = self._space_is_group(space)
+        if is_group and self._group_requires_mention(space_name) and not self._message_mentions_bot(msg):
+            logger.debug("[GoogleChat] drop group message (mention required, space=%s)", space_name)
+            return False
+        if not self._source_parity_access:
+            return True
+        if is_group:
+            if not self._is_group_allowed(space_name):
+                logger.debug("[GoogleChat] drop group message (space not allowlisted, space=%s)", space_name)
+                return False
+            if not self._is_group_sender_allowed(space_name, sender_id):
+                logger.debug("[GoogleChat] drop group message (sender not allowed, %s)", sender_id)
+                return False
+            return True
+        if not self._is_dm_intake_allowed(sender_id):
+            logger.debug("[GoogleChat] drop DM (dm_policy=%s, sender=%s)", self._dm_policy, sender_id)
+            return False
+        return True
+
+    def _should_thread_chunk(self, chunk_index: int, thread_id: Optional[str]) -> bool:
+        if not thread_id:
+            return False
+        # Legacy send() threaded every create-path chunk. PlatformConfig defaults
+        # reply_to_mode to "first"; only source-parity policy honors first/off.
+        if not self._source_parity_access:
+            return True
+        if self._reply_to_mode == "off":
+            return False
+        if self._reply_to_mode == "all":
+            return True
+        return chunk_index == 0
 
     # -- configuration -------------------------------------------------------
     def _load_sa_credentials(self) -> Any:
@@ -609,9 +859,12 @@ class GoogleChatAdapter(BasePlatformAdapter):
             logger.warning("[GoogleChat] thread-count store load failed (treating all threads as fresh)", exc_info=True)
         if subscription_path is not None and not await self._check_subscription(subscription_path, credentials):
             return False
-        # Resolve bot user_id (eager): cache first, then members.list.
+        # Resolve bot user_id (eager): configured identity wins, then cache, then members.list.
+        # Mention gating uses this value immediately; do not wait for a membership lookup.
         self._bot_user_id = self._load_cached_bot_id()
-        if not self._bot_user_id:
+        if self._bot_user:
+            self._bot_user_id = self._bot_user
+        elif not self._bot_user_id:
             self._bot_user_id = await self._resolve_bot_user_id()
             if self._bot_user_id:
                 self._save_cached_bot_id(self._bot_user_id)
@@ -749,6 +1002,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
         # Self-filter: drop bot-sourced messages (own replies and other bots).
         if (msg.get("sender") or {}).get("type") == "BOT":
             return None
+        if not self._should_accept_inbound(msg, space):
+            return None
         # Dedup guard — Pub/Sub is at-least-once.
         msg_name = msg.get("name") or ""
         if msg_name and self._dedup.is_duplicate(msg_name):
@@ -792,7 +1047,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 if "created" in ce_type:
                     # ADDED_TO_SPACE for this bot — resolve self user_id.
                     member = (mpl.get("membership") or {}).get("member") or {}
-                    if member.get("type") == "BOT" and not self._bot_user_id and member.get("name"):
+                    if member.get("type") == "BOT" and not self._bot_user and not self._bot_user_id and member.get("name"):
                         self._bot_user_id = member["name"]
                         self._save_cached_bot_id(member["name"])
                     logger.info("[GoogleChat] ADDED_TO_SPACE %s", space.get("name", "?"))
@@ -817,7 +1072,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
         return {}
 
     def verify_http_event_request(self, auth_header: str) -> Tuple[bool, str]:
-        if not self._http_events_audience or not self._http_events_service_account_email:
+        configured_emails = self._configured_http_emails()
+        if not self._http_events_audience or not (self._http_events_app_principal or configured_emails):
             return False, "google_chat_http_events_not_configured"
         token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
         if not token:
@@ -827,10 +1083,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[GoogleChat] HTTP event bearer verification failed: %s", _redact_sensitive(str(exc)))
             return False, "invalid_google_bearer"
-        expected = {item.strip().lower() for item in self._http_events_service_account_email.split(",") if item.strip()}
-        if str(claims.get("email") or "").strip().lower() not in expected:
-            return False, "unexpected_google_bearer_identity"
-        return True, ""
+        return _http_event_identity_allowed(
+            claims, app_principal=self._http_events_app_principal, configured_emails=configured_emails,
+        )
 
     async def _dispatch_message(self, msg: Dict[str, Any], envelope: Dict[str, Any]) -> None:
         """Translate a Chat message to a MessageEvent and hand off.
@@ -914,12 +1169,16 @@ class GoogleChatAdapter(BasePlatformAdapter):
             session_thread_id = thread_name
             if thread_name and space_name:
                 self._last_inbound_thread[space_name] = thread_name
+        # Legacy: email is canonical (GOOGLE_CHAT_ALLOWED_USERS). Source-parity mode
+        # keys pairing/group users on the stable ``users/{id}`` resource name.
+        if self._source_parity_access:
+            user_id, user_id_alt = (sender_name or sender_email), (sender_email or None)
+        else:
+            user_id, user_id_alt = (sender_email or sender_name), (sender_name or None)
         source = self.build_source(
             chat_id=space_name, chat_name=space.get("displayName") or space.get("name") or "", chat_type=chat_type,
-            # Email is the canonical id (allowlists use emails); the ``users/{id}``
-            # resource name moves to user_id_alt.
-            user_id=(sender_email or sender_name), user_name=sender.get("displayName") or sender_email or sender_name,
-            thread_id=session_thread_id, user_id_alt=(sender_name or None),
+            user_id=user_id, user_name=sender.get("displayName") or sender_email or sender_name,
+            thread_id=session_thread_id, user_id_alt=user_id_alt,
         )
         return MessageEvent(
             text=text, message_type=message_type, source=source, raw_message=msg, message_id=msg.get("name") or None,
@@ -1008,8 +1267,10 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 typing_msg_name = None
             patched_typing = False
             for idx, chunk in enumerate(chunks):
-                # Only set thread on the create path; patch inherits.
-                body = _thread_body(chunk, thread_id if (idx > 0 or not typing_msg_name) else None)
+                # Only set thread on the create path; patch inherits. reply_to_mode=all
+                # keeps later chunks in the inbound thread; off/first drop or limit it.
+                chunk_thread = thread_id if self._should_thread_chunk(idx, thread_id) else None
+                body = _thread_body(chunk, chunk_thread if (idx > 0 or not typing_msg_name) else None)
                 try:
                     if idx == 0 and typing_msg_name:
                         last_result = await self._patch_message(typing_msg_name, body)
@@ -1162,7 +1423,11 @@ class GoogleChatAdapter(BasePlatformAdapter):
         """Thread to reply under, or None: ``metadata['thread_id']`` → ``thread_name`` /
         ``thread_ts`` aliases → ``reply_to`` when already a ``spaces/X/threads/Y`` name →
         ``_last_inbound_thread[chat_id]`` (else DM replies land top-level). Cron deliveries
-        (``job_id`` in metadata) skip the last fallback so output is not buried in a stale thread."""
+        (``job_id`` in metadata) skip the last fallback so output is not buried in a stale thread.
+        Source-parity ``reply_to_mode=off`` suppresses threading for every outbound path,
+        including explicit metadata used by ``send_card``."""
+        if self._source_parity_access and self._reply_to_mode == "off":
+            return None
         if metadata:
             for key in ("thread_id", "thread_name", "thread_ts"):
                 if metadata.get(key):
@@ -1538,6 +1803,11 @@ def _is_connected(config: PlatformConfig) -> bool:
 _ENV_SEED_KEYS = (
     ("http_events_audience", "GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE"),
     ("http_events_service_account_email", "GOOGLE_CHAT_HTTP_EVENTS_SERVICE_ACCOUNT_EMAIL"),
+    ("http_events_app_principal", "GOOGLE_CHAT_HTTP_EVENTS_APP_PRINCIPAL"),
+    ("bot_user", "GOOGLE_CHAT_BOT_USER"),
+    ("dm_policy", "GOOGLE_CHAT_DM_POLICY"),
+    ("group_policy", "GOOGLE_CHAT_GROUP_POLICY"),
+    ("require_mention", "GOOGLE_CHAT_REQUIRE_MENTION"),
     ("max_messages", "GOOGLE_CHAT_MAX_MESSAGES"), ("max_bytes", "GOOGLE_CHAT_MAX_BYTES"),
     ("bootstrap_spaces", "GOOGLE_CHAT_BOOTSTRAP_SPACES"), ("debug_raw", "GOOGLE_CHAT_DEBUG_RAW"),
 )

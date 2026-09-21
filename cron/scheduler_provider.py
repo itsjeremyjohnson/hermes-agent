@@ -442,8 +442,8 @@ class InProcessCronScheduler(CronScheduler):
         can_dispatch=None, profile_adapters=None, default_profile=None, profile_gate=None,
     ):
         """Tick every profile's store, each scoped via ``_profile_cron_scope``. ``profile_gate(name,
-        home)``, when given, is consulted every cycle; a rejected profile is neither ticked nor
-        heartbeated."""
+        home)``, when given, gates startup recovery and every cycle; a rejected profile is neither
+        recovered, ticked nor heartbeated."""
         from cron.scheduler import tick as cron_tick
         from cron.scheduler import CronTickYielded, _is_fd_exhaustion
         from cron.scheduler_preflight import (
@@ -472,8 +472,10 @@ class InProcessCronScheduler(CronScheduler):
         # A profile may have been deleted since this snapshot was taken; never recreate a deleted home's
         # cron workspace via the heartbeat below (#47368).
         for entry in _existing_profile_homes(profile_homes):
-            _, home = _profile_entry(entry)
+            name, home = _profile_entry(entry)
             try:
+                if profile_gate is not None and not profile_gate(name, home):
+                    continue
                 with _profile_cron_scope(home):
                     recovered = self.recover_interrupted()
                     if recovered:

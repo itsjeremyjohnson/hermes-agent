@@ -1116,6 +1116,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")))
         # alias (client "model") -> {model, provider?, api_key? (UPSTREAM, never logged), base_url?}
         self._model_routes: Dict[str, Dict[str, Any]] = self._parse_model_routes(extra.get("model_routes"))
+        # Exact public callback path -> default-owned platform (no /p/<profile>/ dimension).
+        self._platform_event_routes, self._platform_event_routes_error = self._parse_platform_event_routes(
+            extra.get("platform_event_routes"))
         # Opt-in bare ``model`` passthrough on OpenAI-compatible surfaces (generic clients
         # hardcode "gpt-4o" etc., hence off by default).
         # Off by default: generic OpenAI clients routinely hardcode model names ("gpt-4o", ...), and
@@ -1367,6 +1370,65 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         normalized = (value or "").strip().lower().replace("-", "_")
         return normalized if re.fullmatch(r"[a-z0-9_]+", normalized) else ""
 
+    _PLATFORM_EVENT_ROUTE_PATH_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9_/-]*$")
+    _PLATFORM_EVENT_ROUTE_RESERVED_PREFIXES = ("/api/", "/v1/", "/p/")
+    _PLATFORM_EVENT_ROUTE_RESERVED_PATHS = frozenset({
+        "/health", "/health/detailed", "/v1/health",
+    })
+
+    def _parse_platform_event_routes(self, raw: Any) -> tuple[Dict[str, str], Optional[str]]:
+        """Validate ``extra.platform_event_routes`` as exact path -> platform.
+
+        Invalid config is returned as an error string so ``connect()`` can refuse
+        before binding a listener. Absent/empty mappings are a no-op.
+        """
+        if raw is None or raw == {}:
+            return {}, None
+        if not isinstance(raw, dict):
+            return {}, "platform_event_routes must be a mapping of exact path to platform"
+        native_paths = {path for _method, path, _handler in self._http_route_table()}
+        routes: Dict[str, str] = {}
+        seen_platforms: Dict[str, str] = {}
+        for path, platform in raw.items():
+            if not isinstance(path, str):
+                return {}, f"platform_event_routes path must be a string, got {type(path).__name__}"
+            path = path.strip()
+            if (
+                not self._PLATFORM_EVENT_ROUTE_PATH_RE.fullmatch(path)
+                or path.endswith("/")
+                or "//" in path
+            ):
+                return {}, f"platform_event_routes path {path!r} is not an exact public callback path"
+            if (
+                path in self._PLATFORM_EVENT_ROUTE_RESERVED_PATHS
+                or path in native_paths
+                or any(path.startswith(prefix) for prefix in self._PLATFORM_EVENT_ROUTE_RESERVED_PREFIXES)
+            ):
+                return {}, f"platform_event_routes path {path!r} conflicts with a reserved API route"
+            if not isinstance(platform, str):
+                return {}, (
+                    f"platform_event_routes[{path!r}] must be a platform name string, "
+                    f"got {type(platform).__name__}"
+                )
+            platform_name = self._normalize_callback_platform(platform)
+            if not platform_name:
+                return {}, f"platform_event_routes[{path!r}] has an invalid platform name"
+            if path in routes:
+                return {}, f"platform_event_routes path {path!r} is duplicated"
+            prior = seen_platforms.get(platform_name)
+            if prior is not None and prior != path:
+                return {}, (
+                    f"platform_event_routes maps {prior!r} and {path!r} to the same platform "
+                    f"{platform_name!r}"
+                )
+            routes[path] = platform_name
+            seen_platforms[platform_name] = path
+        return routes, None
+
+    def _platform_event_alias_route_table(self) -> List[tuple]:
+        """Exact POST aliases from ``platform_event_routes``; not mirrored under /p/<profile>/."""
+        return [("POST", path, self._handle_platform_event_alias) for path in self._platform_event_routes]
+
     def _get_platform_callback_adapter(
         self, request: "web.Request", platform_name: str) -> Optional[Any]:
         injected = request.app.get("platform_event_adapters")
@@ -1387,10 +1449,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     return candidate
         return None
 
+    async def _handle_platform_event_alias(self, request: "web.Request") -> "web.Response":
+        """Dispatch a configured exact-path alias to the default-owned platform adapter."""
+        platform_name = self._platform_event_routes.get(request.rel_url.path, "")
+        if not platform_name:
+            return _error_response("Unknown platform event route", 404, code="unknown_platform_event_route")
+        return await self._dispatch_platform_event(request, platform_name)
+
     async def _handle_platform_event_callback(self, request: "web.Request") -> "web.Response":
         platform_name = self._normalize_callback_platform(request.match_info.get("platform", ""))
         if not platform_name:
             return _error_response("Invalid platform name", 400, code="invalid_platform")
+        return await self._dispatch_platform_event(request, platform_name)
+
+    async def _dispatch_platform_event(self, request: "web.Request", platform_name: str) -> "web.Response":
         adapter = self._get_platform_callback_adapter(request, platform_name)
         if adapter is None:
             return _error_response("Platform adapter is not connected", 503, code="platform_unavailable")
@@ -3833,6 +3905,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "`/platform resume api_server`.",
                 retryable=False)
             return False
+        if self._platform_event_routes_error:
+            logger.error("[%s] Refusing to start: %s", self.name, self._platform_event_routes_error)
+            self._set_fatal_error(
+                "api_server_platform_event_routes_invalid",
+                self._platform_event_routes_error,
+                retryable=False)
+            return False
         try:
             mws = [mw for mw in (
                 self._make_profile_prefix_middleware(), cors_middleware, body_limit_middleware,
@@ -3844,6 +3923,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+            # Exact public aliases stay on the default listener; they are not /p/<profile>/ mirrors.
+            for method, path, handler in self._platform_event_alias_route_table():
+                self._app.router.add_route(method, path, handler)
             # After native routes: Relay bootstrap shims feature-detect on this key and must
             # no-op rather than shadow the native session-control handlers.
             self._app["api_server_adapter"] = self

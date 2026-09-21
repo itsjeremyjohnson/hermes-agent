@@ -120,6 +120,7 @@ def test_reap_passes_child_pid_exclude_to_scan():
 # ---------------------------------------------------------------------------
 
 import json
+import pytest
 from hermes_cli.dashboard_procs import (
     _lock_owned_serve_pids,
     _valid_lockfile_payload,
@@ -159,6 +160,37 @@ def test_lock_owned_serve_pids_reads_valid_backend_lock(tmp_path):
         json.dumps({**_valid_lock_payload(8888, other_oid, nonce), "schemaVersion": 99})
     )
     assert _lock_owned_serve_pids(base_dir=lock_root) == {7777}
+
+
+@pytest.mark.parametrize("active_profile", [None, "wren"])
+def test_reap_preserves_root_owned_profiles_and_reaps_unowned_orphan(tmp_path, monkeypatch, active_profile):
+    """Named profile startup must see the shared SSH locks, including siblings."""
+    root = tmp_path / "hermes"
+    current = root / "profiles" / active_profile if active_profile else root
+    monkeypatch.setenv("HERMES_HOME", str(current))
+    monkeypatch.delenv("HERMES_DESKTOP_CHILD_PID", raising=False)
+    remote_pids = {7777, 8888}
+    for pid, oid, profile in [(7777, "a" * 32, "wren"), (8888, "b" * 32, "rm-infra")]:
+        lock_dir = root / "desktop-ssh" / oid
+        lock_dir.mkdir(parents=True)
+        payload = _valid_lock_payload(pid, oid, "d" * 16)
+        payload.update(profile=profile, hermesHome=str(root / "profiles" / profile))
+        (lock_dir / "backend.lock.json").write_text(json.dumps(payload))
+    scanned = [(pid, "hermes serve --isolated --host 127.0.0.1 --port 0")
+               for pid in [7777, 8888, 9999]]
+    with (
+        patch("hermes_cli.dashboard_procs._scan_dashboard_processes", return_value=scanned) as scan,
+        patch("hermes_cli.dashboard_procs._process_ppid", return_value=1),
+        patch("os.kill") as kill,
+        patch("psutil.pid_exists", return_value=False),
+        patch("sys.platform", "linux"),
+    ):
+        result = _reap_orphaned_desktop_local_serves(
+            sleep_fn=lambda _: None, process_age_seconds_fn=lambda _: 600.0,
+        )
+    assert remote_pids <= scan.call_args.kwargs["exclude_pids"]
+    assert result == {"matched": [9999], "killed": [9999], "failed": []}
+    assert [call.args[0] for call in kill.call_args_list] == [9999]
 
 
 def test_valid_lockfile_payload_rejects_wrong_owner_and_shape():

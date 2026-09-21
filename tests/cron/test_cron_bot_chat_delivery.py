@@ -135,7 +135,7 @@ def test_deliver_runs_canonical_bot_chat_lane():
     assert err is None
     argv = calls["argv"]
     assert argv[0] == "/usr/bin/hermes"
-    assert "-p" not in argv  # own profile: subprocess inherits HERMES_HOME
+    assert "-p" in argv  # explicit selector prevents active_profile from redirecting own delivery
     assert "chat" in argv
     assert "Bot Chat" in argv
     assert "--create-if-missing" in argv
@@ -145,7 +145,7 @@ def test_deliver_runs_canonical_bot_chat_lane():
     assert not any("the output" in str(a) for a in argv)
 
 
-def test_deliver_named_profile_uses_p_flag_and_clears_home():
+def test_deliver_named_profile_pins_home_and_selector():
     calls = {}
 
     def fake_run(argv, **kwargs):
@@ -161,8 +161,8 @@ def test_deliver_named_profile_uses_p_flag_and_clears_home():
     assert err is None
     argv = calls["argv"]
     assert argv[1:3] == ["-p", "research"]
-    # -p owns resolution; the scheduler's own HERMES_HOME must not leak in.
-    assert "HERMES_HOME" not in calls["kwargs"]["env"]
+    # Preserve the selected profile inside the same custom root.
+    assert calls["kwargs"]["env"]["HERMES_HOME"] == "/tmp/other-profile/profiles/research"
 
 
 def test_deliver_failure_returns_error_string():

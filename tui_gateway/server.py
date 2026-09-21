@@ -2564,6 +2564,8 @@ def _session_pending_kind(sid: str) -> str:
 def _session_live_status(sid: str, session: dict) -> str:
     if _session_pending_kind(sid):
         return "waiting"
+    if session.get("_auto_continue_scheduled") and not session.get("running"):
+        return "starting"
     ready = session.get("agent_ready")
     # Unset + build never started = a lazy watch session idling, not one stuck mid-construction.
     if ready is not None and not ready.is_set() and session.get("agent_build_started"):
@@ -2687,7 +2689,9 @@ def _live_session_payload(
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(session.get("history") or [])
         inflight, queued = _inflight_snapshot(session), _queued_prompt_snapshot(session)
-        running, turn_started_at = bool(session.get("running")), _turn_started_at(session)
+        # Recovery owns the pending turn even while its agent is still building.
+        running = bool(session.get("running") or session.get("_auto_continue_scheduled"))
+        turn_started_at = _turn_started_at(session)
     # Persisted display lineage via the session's profile-aware DB (not the launch ``_get_db()``), read
     # outside the history lock (the DB has its own). ``omit_messages`` skips the read (fast path).
     if omit_messages:

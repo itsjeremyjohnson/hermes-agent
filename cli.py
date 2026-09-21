@@ -960,7 +960,9 @@ def _wait_for_oneshot_background_completions(cli) -> None:
     from tools.process_registry import process_registry
 
     _agent, task_id = _oneshot_agent_and_session(cli)
-    result = process_registry.wait_for_pending_completions(None)
+    deadline = getattr(cli, "_oneshot_completion_deadline", None)
+    remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+    result = process_registry.wait_for_pending_completions(None, timeout=remaining)
     if result.get("waited"):
         logger.info(
             "One-shot exit linger for session %s: completed=%s timed_out=%s",
@@ -4055,26 +4057,25 @@ def _sync_cli_session_id_from_agent(cli) -> None:
 
 def _run_quiet_single_query(cli, effective_query):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code."""
+    from hermes_cli.cli_process_notifications import quiet_results_with_manager_completions
+
     try:
         result = cli.agent.run_conversation(user_message=effective_query, conversation_history=cli.conversation_history)
+        for result in quiet_results_with_manager_completions(cli, result):
+            # Compression can rotate the stored session during any review turn.
+            _sync_cli_session_id_from_agent(cli)
+            response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+            if (
+                not response and isinstance(result, dict) and result.get("error")
+                and (result.get("failed") or result.get("partial"))
+            ):
+                print(f"Error: {result['error']}", file=sys.stderr)
+            elif response:
+                print(response, flush=True)
     except KeyboardInterrupt:
         _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
         sys.exit(130)
-    # The exit line below reports session_id to stderr for automation wrappers;
-    # without this sync it would point at the ended parent after compression.
-    _sync_cli_session_id_from_agent(cli)
-    response = result.get("final_response", "") if isinstance(result, dict) else str(result)
-    # Surface backend errors that produced no visible output (e.g. invalid model slug
-    # -> provider 4xx) on stderr so piped stdout stays clean.
-    if (
-        not response and isinstance(result, dict) and result.get("error")
-        and (result.get("failed") or result.get("partial"))
-    ):
-        print(f"Error: {result['error']}", file=sys.stderr)
-    elif response:
-        print(response)
-
     # Kanban goal_mode: keep working in THIS session until a judge agrees the card is
     # done, the worker terminates it, or the turn budget runs out (sticky block).
     if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":

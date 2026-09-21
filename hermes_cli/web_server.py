@@ -102,12 +102,27 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
             profile_homes = list(profiles_to_serve(multiplex=True))
             if len(profile_homes) > 1:
                 start_kwargs["profile_homes"] = profile_homes
-                # Stand down, per tick, for a profile whose OWN gateway runs:
-                # it ticks with live adapters, and the tick-lock race would
+                # Stand down for an own gateway or the default multiplexer:
+                # either ticks with live adapters, and the tick-lock race would
                 # otherwise deliver through the standalone path (#100489).
                 from hermes_cli.profiles import _check_gateway_running
+                from hermes_constants import get_default_hermes_root
+                from gateway.status import get_runtime_status_running_pid, read_runtime_status
 
-                start_kwargs["profile_gate"] = lambda _name, home: not _check_gateway_running(Path(home))
+                def profile_gate(name, home):
+                    if _check_gateway_running(Path(home)):
+                        return False
+                    default_home = get_default_hermes_root()
+                    runtime = read_runtime_status(default_home / "gateway_state.json") or {}
+                    served = runtime.get("served_profiles")
+                    # Membership belongs to the live gateway's boot snapshot;
+                    # editing config.yaml cannot expand its running cron roster.
+                    return not (
+                        isinstance(served, list) and name in served
+                        and get_runtime_status_running_pid(runtime, expected_home=default_home) is not None
+                    )
+
+                start_kwargs["profile_gate"] = profile_gate
                 from hermes_logging import enable_profile_log_routing
 
                 enable_profile_log_routing(profile_homes)

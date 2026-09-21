@@ -665,12 +665,28 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
         logger.warning("Job '%s': %s", job_id, msg, **log_kwargs)
         return msg
 
-    from agent.delegation_context import delegated_child_subprocess_env
-    env = delegated_child_subprocess_env(os.environ)
-    if profile:
-        argv += ["-p", profile]
-        # -p owns profile resolution; this scheduler's HERMES_HOME must not shadow it.
-        env.pop("HERMES_HOME", None)
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, delegated_child_subprocess_env
+    from agent.secret_scope import _is_global_env, current_secret_scope, is_multiplex_active
+    from hermes_cli.profiles import get_profile_dir
+
+    source_home = _sched._get_hermes_home()
+    target_home = get_profile_dir(profile) if profile else source_home
+    own_profile = target_home.resolve() == source_home.resolve()
+    env = dict(os.environ)
+    if not own_profile or is_multiplex_active():
+        # Source-only credentials/locations must not survive the destination's dotenv
+        # load. Reuse the existing process-global allowlist; the child loads its own
+        # profile bindings. A multiplexed own-profile turn may carry its bound scope.
+        env = {key: value for key, value in env.items()
+               if _is_global_env(key) or key == DELEGATED_CHILD_ENV_MARKER}
+        if own_profile:
+            env.update(current_secret_scope() or {})
+    env = delegated_child_subprocess_env(env)
+    # Pin both the routed home and selector: a child has no parent ContextVars,
+    # and an implicit default-home launch could follow an unrelated active_profile.
+    env["HERMES_HOME"] = str(target_home)
+    target_profile = profile or (target_home.name if target_home.parent.name == "profiles" else "default")
+    argv += ["-p", target_profile]
 
     # Prefix marks this as scheduled output, not the human (Bot Mode sender-attribution).
     message = (
@@ -888,6 +904,7 @@ def _send_media_via_adapter(
             except TimeoutError:
                 future.cancel()
                 raise
+            delivery_receipts.observe_result(result)
             if result and not getattr(result, "success", True):
                 _note_target_error(
                     job_ref,
@@ -1200,6 +1217,7 @@ def _live_send_text(
             "assuming delivered (skipping standalone fallback "
             "to avoid duplicate)",
             job["id"], t.platform_name, t.chat_id)
+        delivery_receipts.note_unknown()
         return True, True, None
     except Exception as ex:
         # Real send error (not a slow confirmation): fall through to standalone.
@@ -1441,6 +1459,7 @@ def _deliver_standalone(
         delivery_errors.extend(target_errors)
         return
     result, err = _standalone_send(t, content, media_files)
+    delivery_receipts.observe_result(result)
     if err is None and result and result.get("error"):
         # Not inside an except block — the error comes from the result dict, no traceback.
         err = f"delivery error: {result['error']} (target {t.where})"
@@ -1592,6 +1611,10 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
     return msg
 
 
+from cron import delivery_receipts
+
+
+@delivery_receipts.track_delivery
 def _deliver_result(
     job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
 ) -> Optional[str]:
@@ -1599,7 +1622,9 @@ def _deliver_result(
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
-    targets = _resolve_delivery_targets(job, for_failure=for_failure)
+    targets = delivery_receipts.bound_targets()
+    if targets is None:
+        targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
         return _unresolved_delivery_outcome(job, for_failure)
 
@@ -1704,6 +1729,7 @@ def _deliver_result(
     # Filter-time drops apply to every target; report them once.
     delivery_errors.extend(policy_drop_errors)
     _record_delivery_verification(job, unverified_targets)
+    delivery_receipts.note_verification(not unverified_targets)
     return "; ".join(delivery_errors) if delivery_errors else None
 
 
