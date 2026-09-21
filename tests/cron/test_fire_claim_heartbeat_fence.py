@@ -1,9 +1,8 @@
-"""Busy fire fence is exclusive ownership, not a stolen claim.
+"""A held fire fence must not block claim refresh or look like a stolen claim.
 
-PrimeVPS/Blog delivered cards then native last_status became "Interrupted by
-shutdown" because heartbeat_fire_claim treated a fire-fence timeout as
-ownership loss. A live same-job OS fence prevents claim theft, so fence-busy
-must not age into heartbeat grace. Stolen owners still return False.
+The run thread holds the per-job fence across delivery. Heartbeat refresh stays
+on the jobs lock, so a busy fence does not block refresh or age
+into ownership-lost grace. A different owner still returns False.
 """
 import threading
 import time
@@ -28,8 +27,8 @@ def _claimed_job():
     return stored
 
 
-def test_busy_fence_raises_typed_busy_not_false(temp_home, monkeypatch):
-    """A live delivery lock must raise FireClaimFenceBusy, not look stolen."""
+def test_busy_fence_does_not_block_refresh_or_look_stolen(temp_home, monkeypatch):
+    """A held delivery fence must not prevent refresh and must not look stolen."""
     import cron.jobs as jobs
 
     job = _claimed_job()
@@ -50,9 +49,8 @@ def test_busy_fence_raises_typed_busy_not_false(temp_home, monkeypatch):
     assert held.wait(timeout=2)
     assert result["owns"] is True
 
-    with pytest.raises(jobs.FireClaimFenceBusy, match="fire fence busy"):
-        jobs.heartbeat_fire_claim(job["id"], expected_owner=owner)
-
+    assert jobs.heartbeat_fire_claim(job["id"], expected_owner=owner) is True
+    assert jobs.heartbeat_fire_claim(job["id"], expected_owner="replacement-owner") is False
     assert jobs.get_job(job["id"])["fire_claim"]["by"] == owner
     release.set()
     thread.join(timeout=2)

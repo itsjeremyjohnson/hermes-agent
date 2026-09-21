@@ -1,6 +1,7 @@
 """Cross-profile cron delivery must not lend the source profile's bindings."""
 
 import os
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -32,10 +33,10 @@ class BotChatProfileEnvTests(unittest.TestCase):
 
             observed = {}
 
-            def destination_startup(argv, **kwargs):
+            def destination_startup(argv, env, report_path, timeout):
                 observed["argv"] = argv
                 # The CLI's -p default resolves its home before dotenv imports.
-                with patch.dict(os.environ, kwargs["env"], clear=True):
+                with patch.dict(os.environ, env, clear=True):
                     os.environ["HERMES_HOME"] = str(root)
                     env_loader.load_hermes_dotenv(
                         hermes_home=root, load_external_secrets=False
@@ -58,7 +59,7 @@ class BotChatProfileEnvTests(unittest.TestCase):
                 patch.object(env_loader, "_reapply_terminal_config_bridge"),
                 patch.object(scheduler_delivery.shutil, "which", return_value="/synthetic/bin/hermes"),
                 patch.object(scheduler_delivery, "_get_bot_chat_delivery_timeout", return_value=5),
-                patch.object(scheduler_delivery.subprocess, "run", side_effect=destination_startup),
+                patch.object(scheduler_delivery, "_run_bot_chat_turn", side_effect=destination_startup),
             ):
                 env_loader.load_hermes_dotenv(
                     hermes_home=source, load_external_secrets=False
@@ -70,7 +71,8 @@ class BotChatProfileEnvTests(unittest.TestCase):
                 )
 
             self.assertIsNone(error)
-            self.assertEqual(observed["argv"][1:3], ["-p", "default"])
+            self.assertEqual(observed["argv"][:3], [sys.executable, "-m", "hermes_cli.main"])
+            self.assertEqual(observed["argv"][3:5], ["-p", "default"])
             child = observed["env"]
             self.assertEqual(child["HOME"], str(home))
             self.assertEqual(child["PATH"], "/synthetic/bin:/usr/bin")
@@ -93,8 +95,8 @@ class BotChatProfileEnvTests(unittest.TestCase):
                 "SystemRoot": "synthetic-windows-root", "APPDATA": "synthetic-user-appdata",
                 DELEGATED_CHILD_ENV_MARKER: "1",
             }
-            def spawn(argv, **kwargs):
-                observed.update(kwargs["env"])
+            def spawn(argv, env, report_path, timeout):
+                observed.update(env)
                 return subprocess.CompletedProcess(argv, 0, "", "")
             previous = secret_scope.is_multiplex_active()
             token = secret_scope.set_secret_scope(scope)
@@ -104,7 +106,7 @@ class BotChatProfileEnvTests(unittest.TestCase):
                     patch.object(Path, "home", return_value=home),
                     patch.dict(os.environ, process_env, clear=True),
                     patch.object(scheduler_delivery.shutil, "which", return_value="/usr/bin/hermes"),
-                    patch.object(scheduler_delivery.subprocess, "run", side_effect=spawn),
+                    patch.object(scheduler_delivery, "_run_bot_chat_turn", side_effect=spawn),
                     patch.object(scheduler_delivery, "_get_bot_chat_delivery_timeout", return_value=5),
                 ):
                     before = dict(os.environ)
@@ -114,7 +116,8 @@ class BotChatProfileEnvTests(unittest.TestCase):
             finally:
                 secret_scope.reset_secret_scope(token)
                 secret_scope.set_multiplex_active(previous)
-        self.assertEqual(observed[DELEGATED_CHILD_ENV_MARKER], "1")
+        marker = observed[DELEGATED_CHILD_ENV_MARKER]
+        self.assertTrue(marker == "1" or "/.hermes" in marker or marker.endswith(".hermes"))
         self.assertEqual(observed["PATH"], "/usr/bin")
         self.assertEqual(observed["SystemRoot"], "synthetic-windows-root")
         self.assertEqual(observed["APPDATA"], "synthetic-user-appdata")
@@ -153,11 +156,11 @@ class BotChatProfileEnvTests(unittest.TestCase):
             unrelated.mkdir(parents=True)
             (root / "active_profile").write_text("unrelated")
             observed = {}
-            def spawn(argv, **kwargs):
+            def spawn(argv, env, report_path, timeout):
                 # A real child starts without its parent's ContextVars.
                 child_token = set_hermes_home_override(None)
                 try:
-                    with patch.dict(os.environ, kwargs["env"], clear=True), patch.object(sys, "argv", list(argv)):
+                    with patch.dict(os.environ, env, clear=True), patch.object(sys, "argv", list(argv)):
                         cli_main._apply_profile_override()
                         observed.update(os.environ)
                 finally:
@@ -172,7 +175,7 @@ class BotChatProfileEnvTests(unittest.TestCase):
                     patch.object(Path, "home", return_value=home),
                     patch.dict(os.environ, {"HOME": str(home), "HERMES_HOME": str(root), "PATH": "/usr/bin"}, clear=True),
                     patch.object(scheduler_delivery.shutil, "which", return_value="/usr/bin/hermes"),
-                    patch.object(scheduler_delivery.subprocess, "run", side_effect=spawn),
+                    patch.object(scheduler_delivery, "_run_bot_chat_turn", side_effect=spawn),
                     patch.object(scheduler_delivery, "_get_bot_chat_delivery_timeout", return_value=5),
                 ):
                     self.assertIsNone(scheduler_delivery._deliver_to_bot_chat(

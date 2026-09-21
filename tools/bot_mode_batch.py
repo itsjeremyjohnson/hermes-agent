@@ -21,7 +21,8 @@ def configure_manager_schema(schema: dict) -> None:
         "directly; serialize actual dependencies and conflicting writes. Each delivery "
         "starts in the background and returns its own acknowledgement or error, not "
         "the worker's result. Dispatch all ready work before ending your turn; do not "
-        "wait or poll. Review automatic worker returns. Partial failures do not undo "
+        "wait or poll unless a receipt returns reply_delivery=poll; then follow its wait instruction "
+        "after dispatching ready work. Review automatic worker returns. Partial failures do not undo "
         "successful sends: never resend the whole batch. Use the live roster and "
         "connection-qualified targets where names are ambiguous."
     )
@@ -82,16 +83,18 @@ def dispatch_batch(assignments: Any, *, mixed_form: bool,
             logger.warning("Batch acknowledgement unavailable at index %s (%s)", index, type(exc).__name__)
             result = {"status": "unknown", "error": "Dispatch acknowledgement unavailable; check recipient before retrying."}
         results.append({"index": index, "target": assignment["target"], "result": result})
-    sent = sum(entry["result"].get("status") == "sent" for entry in results)
+    sent = sum(entry["result"].get("status") == "queued" for entry in results)
     if sent == len(results):
         status = "sent"
     elif sent:
         status = "partial"
+    elif any(entry["result"].get("status") in {"unknown", "ambiguous"} for entry in results):
+        status = "unknown"
     else:
         status = "failed"
     return json.dumps({
         "status": status,
         "sent": sent,
         "results": results,
-        "detail": "Dispatch complete, not worker completion. Review automatic returns. Do not resend successful or ambiguous entries.",
+        "detail": "Dispatch complete, not worker completion. Follow each receipt's reply instructions. Entries with notification_error will not wake you; inspect their outcome without resending. For reply_delivery=poll, follow the wait instruction. Do not resend successful or ambiguous entries.",
     })

@@ -19,16 +19,16 @@ def isolated_store(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("instant, legacy_result", [
     ("2026-03-01T00:00:00+00:00", "2026-03-01T23:00:00-06:00"),
-    ("2026-03-08T00:00:00+00:00", "2026-03-08T22:00:00-05:00"),
-    ("2026-11-01T00:00:00+00:00", "2026-11-02T00:00:00-06:00"),
+    ("2026-03-08T00:00:00+00:00", "2026-03-08T23:00:00-05:00"),
+    ("2026-11-01T00:00:00+00:00", "2026-11-01T23:00:00-06:00"),
 ])
 def test_explicit_utc_next_run_ignores_chicago_dst(instant, legacy_result):
     schedule = {"kind": "cron", "expr": "0 23 * * 0", "timezone": "UTC"}
     actual = datetime.fromisoformat(J.compute_next_run(schedule, instant))
     assert actual.weekday() == 6
     assert (actual.hour, actual.minute, actual.utcoffset().total_seconds()) == (23, 0, 0)
-    # Preserve the installed croniter's existing profile-default DST behavior;
-    # this opt-in change does not repair its separate transition-hour quirk.
+    # Profile-default cron uses upstream wall-clock fold selection, so transition
+    # hours stay on 23:00 local instead of the old one-hour offset quirk.
     assert J.compute_next_run({"kind": "cron", "expr": schedule["expr"]}, instant) == legacy_result
 
 
@@ -43,6 +43,10 @@ def test_actual_store_due_tick_keeps_utc_occurrence_and_advances_once():
     assert [j["id"] for j in due] == [job["id"]]
     assert J.get_job(job["id"])["next_run_at"] == "2026-09-06T23:00:00+00:00"
     J.advance_next_run(job["id"])
+    assert J.get_job(job["id"])["next_run_at"] == "2026-09-13T23:00:00+00:00"
+    # The due scan stamps pending_slot. Until claim, the next scan restores it.
+    assert [j["id"] for j in J.get_due_jobs()] == [job["id"]]
+    assert J.claim_job_for_fire(job["id"]) is True
     assert J.get_job(job["id"])["next_run_at"] == "2026-09-13T23:00:00+00:00"
     assert J.get_due_jobs() == []
 

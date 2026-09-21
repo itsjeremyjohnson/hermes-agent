@@ -56,7 +56,7 @@ def test_real_agent_memory_init_excludes_cron_and_delegate_but_keeps_manager(tmp
     def create(platform, skip_memory=False):
         agent = SimpleNamespace(
             session_id=platform, enabled_toolsets=["memory"], disabled_toolsets=[],
-            tools=[], valid_tool_names=set(), _session_db=None,
+            tools=[], valid_tool_names=set(), _session_db=None, session_cwd=None,
             _emit_warning=lambda *a: None, _emit_status=lambda *a: None,
             **{f"_{name}": None for name in _GATEWAY_IDENTITY_PARAMS},
         )

@@ -88,7 +88,7 @@ def test_desktop_gate_rejects_stale_record_pointing_at_unrelated_live_pid(monkey
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.delenv("GATEWAY_MULTIPLEX_PROFILES", raising=False)
     monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
-    assert profiles._served_by_running_multiplexer("served")
+    assert not profiles._served_by_running_multiplexer("served")
     assert not profiles._check_gateway_running(root)
 
     class RecordingBuiltin(scheduler_provider.InProcessCronScheduler):

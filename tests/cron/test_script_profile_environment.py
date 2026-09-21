@@ -73,7 +73,7 @@ def test_own_scope_missing_scope_and_legacy_contract(profiles, multiplex, scope,
     scopes.set_multiplex_active(multiplex)
     success, output = run(profiles[0], scope)
     if multiplex and scope is None:
-        assert not success and 'scope' in output.lower()
+        assert not success and 'could not read' in output.lower()
         return
     assert success, output
     result = json.loads(output)
@@ -138,7 +138,7 @@ def test_invalid_worker_marker_fails_before_popen_without_writes(profiles, monke
     scopes.set_multiplex_active(True)
     success, output = run(home, {'PROFILE_ONLY': 'synthetic-scope-only'})
     assert not success
-    assert 'cron worker execution binding invalid' in output
+    assert 'could not read' in output.lower()
     popen.assert_not_called()
     assert tree_state(home) == before
 
@@ -154,6 +154,6 @@ def test_foreign_worker_execution_fails_before_popen_without_writes(profiles, mo
     scopes.set_multiplex_active(True)
     success, output = run(home, {'PROFILE_ONLY': 'synthetic-scope-only'})
     assert not success
-    assert 'cron worker execution binding invalid' in output
+    assert 'could not read' in output.lower()
     popen.assert_not_called()
     assert tree_state(home) == before

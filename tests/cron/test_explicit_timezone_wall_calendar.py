@@ -73,6 +73,9 @@ def test_real_store_due_advance_and_cadence_across_dst(tmp_path, monkeypatch, ba
             assert J._cron_next_run_matches_expr(job["schedule"], clock[0])
             J.advance_next_run(job["id"])
             assert J.get_job(job["id"])["next_run_at"] == second
+            assert [row["id"] for row in J.get_due_jobs()] == [job["id"]]
+            assert J.claim_job_for_fire(job["id"]) is True
+            assert J.get_job(job["id"])["next_run_at"] == second
             assert J.get_due_jobs() == []
     finally:
         J._cron_cadence_cache.clear()

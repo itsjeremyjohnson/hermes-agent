@@ -13,7 +13,8 @@ from tests.tools.test_bot_mode_dm import _FakeAgent, _managed_home
 from tools import bot_mode_dm, bot_mode_probe
 
 
-def test_manager_config_schema_protocol_and_batch_containment(tmp_path, monkeypatch):
+@pytest.mark.parametrize("notify", [True, False])
+def test_manager_config_schema_protocol_and_batch_containment(tmp_path, monkeypatch, notify):
     from agent.agent_init import _apply_agent_section
     from agent.system_prompt import _bot_mode_parts
     from hermes_cli.config import load_config_readonly
@@ -52,7 +53,7 @@ def test_manager_config_schema_protocol_and_batch_containment(tmp_path, monkeypa
     launched = []
     def spawn(command, **kwargs):
         launched.append((command, kwargs))
-        return json.dumps({'session_id': f'proc-{len(launched)}'})
+        return json.dumps({'session_id': f'proc-{len(launched)}', 'notify_on_complete': notify})
     monkeypatch.setattr('tools.terminal_tool.terminal_tool', spawn)
     call = INLINE_TOOL_EXECUTORS['message_agent']
     ctx = InlineToolContext(effective_task_id='manager-test')
@@ -70,13 +71,21 @@ def test_manager_config_schema_protocol_and_batch_containment(tmp_path, monkeypa
     assert not launched
     result = json.loads(call(manager, {'assignments': [assignment, {'target': 'missing', 'message': 'no'}]}, ctx))
     assert result['status'] == 'partial' and result['sent'] == 1
-    assert result['results'][0]['result']['status'] == 'sent'
+    assert result['results'][0]['result']['status'] == 'queued'
     assert 'error' in result['results'][1]['result']
-    assert 'before ending' in result['results'][0]['result']['detail']
+    receipt = result['results'][0]['result']
+    assert receipt['reply_delivery'] == ('notification' if notify else 'poll')
+    assert 'before ending' in receipt['detail'].lower()
+    if not notify:
+        assert receipt['process_id'] in receipt['detail']
     assert len(launched) == 1
+    limit = json.loads(call(manager, {'assignments': [assignment] * 8}, ctx))
+    assert limit['status'] == 'sent' and limit['sent'] == 8
+    assert [entry['index'] for entry in limit['results']] == list(range(8))
+    assert len(launched) == 9
     # Captured launches never ran their cleanup-owning runner.
     for command, _ in launched:
-        Path(shlex.split(command)[4]).unlink(missing_ok=True)
+        Path(shlex.split(command)[shlex.split(command).index("query-file") + 1]).unlink(missing_ok=True)
     bot_mode_probe._reset_cache_for_tests()
 
 
@@ -105,6 +114,7 @@ while not (root / 'release').exists():
 print(name + ' completed')
 ''')
     worker.chmod(0o755)
+    monkeypatch.setattr("tools.bot_relay._hermes_cli", lambda: str(worker))
     monkeypatch.setenv('HOME', str(tmp_path))
     monkeypatch.setenv('SHELL', '/bin/bash')
     # Recreate the installed CLI/import environment inside this isolated shell home.
@@ -125,7 +135,7 @@ print(name + ' completed')
             {'target': 'researcher', 'message': 'research payload'},
             {'target': 'coder', 'message': 'code payload'}
         ]}, InlineToolContext(effective_task_id='overlap-test')))
-        assert result['sent'] == 2, result
+        assert result['sent'] == 2, json.dumps(result, indent=2)
         processes = [registry.get(entry['result']['process_id']) for entry in result['results']]
         deadline = time.monotonic() + 15
         while not all((tmp_path / f'{name}.started').exists() for name in ('researcher', 'coder')):
@@ -209,16 +219,16 @@ def test_batch_containment_and_failure_continuation(tmp_path, monkeypatch, caplo
             attempted.append(target)
             if len(attempted) == 1:
                 raise RuntimeError('private assignment content')
-            return json.dumps({'status': 'sent'})
+            return json.dumps({'status': 'queued'})
         monkeypatch.setattr(bot_mode_dm, 'message_agent_tool', uncertain_delivery)
         result = json.loads(call(manager, {'assignments': assignments[:2]}, ctx))
         assert attempted == ['researcher', 'coder']
         assert 'Batch acknowledgement unavailable at index 0 (RuntimeError)' in caplog.text
         assert 'private assignment content' not in caplog.text
         assert result['results'][0]['result']['status'] == 'unknown'
-        assert result['results'][1]['result']['status'] == 'sent'
+        assert result['results'][1]['result']['status'] == 'queued'
     finally:
         for command in launched:
-            Path(shlex.split(command)[4]).unlink(missing_ok=True)
+            Path(shlex.split(command)[shlex.split(command).index("query-file") + 1]).unlink(missing_ok=True)
         db.close()
         bot_mode_probe._reset_cache_for_tests()

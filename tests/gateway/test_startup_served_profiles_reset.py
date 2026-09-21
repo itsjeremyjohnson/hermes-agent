@@ -20,8 +20,11 @@ def _start_over_old_roster(tmp_path, monkeypatch):
     runner = SimpleNamespace(
         config=SimpleNamespace(sessions_dir=tmp_path / "sessions"),
         _start_log_systemd_timing_alignment=lambda: None,
+        _start_loop_liveness_guards=lambda _loop: None,
+        _log_agent_budget=lambda: None,
+        _note_served_profiles=lambda _homes: None,
     )
-    GatewayStartupMixin._start_log_startup_environment(runner)
+    asyncio.run(GatewayStartupMixin._start_log_startup_environment(runner))
     return runner
 
 
