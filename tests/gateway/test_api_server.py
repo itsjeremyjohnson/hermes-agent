@@ -26,6 +26,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -2086,6 +2087,10 @@ class TestPlatformEventCallbackEndpoint:
         assert fake.dispatched == [{"type": "MESSAGE", "text": "hi"}]
 
 
+class _AliasGatewayRunner(GatewayAuthorizationMixin, types.SimpleNamespace):
+    """Use the real profile authorization boundary with isolated adapter maps."""
+
+
 class TestPlatformEventRouteAliases:
     def test_reserved_alias_fails_before_listener_starts(self, monkeypatch):
         monkeypatch.delenv("API_SERVER_KEY", raising=False)
@@ -2126,7 +2131,7 @@ class TestPlatformEventRouteAliases:
     async def test_unsigned_alias_is_rejected(self):
         default = _FakeGoogleChatAdapter(verify_ok=False, verify_code="missing_google_bearer")
         adapter = _make_alias_adapter({"/googlechat": "google_chat"})
-        adapter.gateway_runner = types.SimpleNamespace(
+        adapter.gateway_runner = _AliasGatewayRunner(
             adapters={Platform("google_chat"): default},
             _profile_adapters={"specialist": {Platform("google_chat"): _FakeGoogleChatAdapter()}},
         )
@@ -2144,7 +2149,7 @@ class TestPlatformEventRouteAliases:
     async def test_bad_bearer_alias_is_rejected(self):
         default = _FakeGoogleChatAdapter(verify_ok=False, verify_code="invalid_google_bearer")
         adapter = _make_alias_adapter({"/googlechat": "google_chat"})
-        adapter.gateway_runner = types.SimpleNamespace(
+        adapter.gateway_runner = _AliasGatewayRunner(
             adapters={Platform("google_chat"): default},
             _profile_adapters={},
         )
@@ -2167,7 +2172,7 @@ class TestPlatformEventRouteAliases:
         default = _FakeGoogleChatAdapter()
         specialist = _FakeGoogleChatAdapter()
         adapter = _make_alias_adapter({"/googlechat": "google_chat"})
-        adapter.gateway_runner = types.SimpleNamespace(
+        adapter.gateway_runner = _AliasGatewayRunner(
             adapters={Platform("google_chat"): default},
             _profile_adapters={"specialist": {Platform("google_chat"): specialist}},
         )
@@ -2190,7 +2195,7 @@ class TestPlatformEventRouteAliases:
     async def test_alias_does_not_fall_back_to_specialist_adapter(self):
         specialist = _FakeGoogleChatAdapter()
         adapter = _make_alias_adapter({"/googlechat": "google_chat"})
-        adapter.gateway_runner = types.SimpleNamespace(
+        adapter.gateway_runner = _AliasGatewayRunner(
             adapters={},
             _profile_adapters={"specialist": {Platform("google_chat"): specialist}},
         )
