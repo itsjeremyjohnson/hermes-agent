@@ -77,7 +77,11 @@ def test_one_desktop_at_a_time_syncs_and_drains_a_gateway(home, monkeypatch):
     gateway's roster relabelled every row each minute and either could drain an envelope addressed
     in the other's ids (JOH-51). The lease holder keeps the gateway; another Desktop is refused until
     the lease goes stale, and envelopes addressed under the old holder are refused, not delivered."""
-    sync, drain = srv._methods["bot_relay.roster.sync"], srv._methods["bot_relay.outbox.drain"]
+    # Through the dispatcher: its wire contract rejects params it does not declare, relay_id included.
+    def rpc(method):
+        return lambda rid, params: srv.handle_request({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+
+    sync, drain = rpc("bot_relay.roster.sync"), rpc("bot_relay.outbox.drain")
     row = {"profile": "scout", "handle": "scout", "connection_id": "charlie"}
     assert _result(sync(1, {"agents": [row], "relay_id": "desk-a"}))["count"] == 1
 

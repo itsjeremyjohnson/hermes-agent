@@ -6332,6 +6332,18 @@
             ],
             "default": null,
             "title": "Profile"
+          },
+          "relay_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Relay Id"
           }
         },
         "title": "BotRelayOutboxDrainParams",
@@ -6445,6 +6457,18 @@
             ],
             "default": null,
             "title": "Agents"
+          },
+          "relay_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Relay Id"
           }
         },
         "title": "BotRelayRosterSyncParams",

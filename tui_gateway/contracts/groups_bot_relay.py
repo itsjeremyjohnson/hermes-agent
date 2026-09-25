@@ -507,6 +507,7 @@ class RelayAgentRow(Params):
 
 class BotRelayRosterSyncParams(ProfileParams):
     agents: list[RelayAgentRow] | None = None
+    relay_id: str | None = None
 
 
 class BotRelayRosterSyncResult(Result):
@@ -518,7 +519,7 @@ method("bot_relay.roster.sync", params=BotRelayRosterSyncParams, result=BotRelay
 
 
 class BotRelayOutboxDrainParams(ProfileParams):
-    pass
+    relay_id: str | None = None
 
 
 class RelayEnvelope(OpenModel):

@@ -1298,6 +1298,7 @@ export interface GroupsPeerRegisterResult {
 export interface BotRelayRosterSyncParams {
   profile?: string | null
   agents?: RelayAgentRow[] | null
+  relay_id?: string | null
 }
 /** A roster row the Desktop pushes (``tools/bot_relay.py::_normalize_roster_row``); invalid rows are dropped server-side, so the shape stays open. */
 export interface RelayAgentRow {
@@ -1315,6 +1316,7 @@ export interface BotRelayRosterSyncResult {
 }
 export interface BotRelayOutboxDrainParams {
   profile?: string | null
+  relay_id?: string | null
 }
 export interface BotRelayOutboxDrainResult {
   envelopes: RelayEnvelope[]
