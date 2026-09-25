@@ -72,6 +72,30 @@ def test_outbox_drain_returns_each_envelope_once(home):
     assert second["envelopes"] == []
 
 
+def test_one_desktop_at_a_time_syncs_and_drains_a_gateway(home, monkeypatch):
+    """Each Desktop labels roster rows with its own connection ids, so two Desktops rewriting one
+    gateway's roster relabelled every row each minute and either could drain an envelope addressed
+    in the other's ids (JOH-51). The lease holder keeps the gateway; another Desktop is refused until
+    the lease goes stale, and envelopes addressed under the old holder are refused, not delivered."""
+    sync, drain = srv._methods["bot_relay.roster.sync"], srv._methods["bot_relay.outbox.drain"]
+    row = {"profile": "scout", "handle": "scout", "connection_id": "charlie"}
+    assert _result(sync(1, {"agents": [row], "relay_id": "desk-a"}))["count"] == 1
+
+    for refused in (sync(2, {"agents": [{**row, "connection_id": "zeus"}], "relay_id": "desk-b"}),
+                    drain(3, {"relay_id": "desk-b"}), drain(4, {})):
+        assert refused["error"]["data"]["reason"] == "relay_not_owner"
+    assert [r["connection_id"] for r in bot_relay.read_remote_roster(home)] == ["charlie"]
+
+    target = bot_relay.read_remote_roster(home)[0]
+    env = bot_relay.enqueue_envelope(home, target=target, message="m", sender_profile="w", sender_handle="w")
+    later = time.time() + bot_relay.RELAY_LEASE_STALE_SECONDS + 1
+    monkeypatch.setattr(bot_relay.time, "time", lambda: later)
+    assert _result(drain(5, {"relay_id": "desk-b"}))["envelopes"] == []
+    reply = json.loads((bot_relay.relay_root(home) / bot_relay.REPLIES_DIR / f"{env['id']}.json").read_text())
+    assert reply["reason"] == "runtime_offline" and "NOT delivered" in reply["error"]
+    assert drain(6, {"relay_id": "desk-a"})["error"]["data"]["reason"] == "relay_not_owner"
+
+
 def test_outbox_drain_reoffers_a_claimed_envelope_the_desktop_never_delivered(home):
     """A Desktop that disconnects between ``outbox.drain`` and ``bot_relay.deliver`` leaves the
     envelope in ``claimed/`` with no reply: silent until the waiter's deadline, then swept, while

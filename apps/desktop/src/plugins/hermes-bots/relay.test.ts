@@ -504,7 +504,7 @@ describe('the roster loop pushes the OTHER connections’ agents', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(calls).toEqual([
-      expect.objectContaining({ connectionId: 'a', method: 'bot_relay.roster.sync', params: { agents: [] } })
+      expect.objectContaining({ connectionId: 'a', method: 'bot_relay.roster.sync', params: expect.objectContaining({ agents: [] }) })
     ])
 
     await vi.advanceTimersByTimeAsync(60_000)
@@ -527,7 +527,7 @@ describe('the roster loop pushes the OTHER connections’ agents', () => {
     hostMock.profileRoutes = vi.fn(async () => [route('a')])
     await vi.advanceTimersByTimeAsync(60_000)
     expect(calls).toEqual([
-      expect.objectContaining({ connectionId: 'a', method: 'bot_relay.roster.sync', params: { agents: [] } })
+      expect.objectContaining({ connectionId: 'a', method: 'bot_relay.roster.sync', params: expect.objectContaining({ agents: [] }) })
     ])
 
     stopBotRelay()
@@ -680,6 +680,31 @@ describe('the drain loop wires drain → deliver → reply', () => {
   })
 })
 
+describe('one Desktop relays per gateway (JOH-51)', () => {
+  it('names itself with one persistent relay id on every roster sync and drain', async () => {
+    // Two Desktops rewrote the same gateway's roster in their own connection
+    // ids. The gateway leases each gateway to one relay id; a Desktop that
+    // sends none, or a new one per launch, cannot hold or keep that lease.
+    const calls = respondWith(() => ({}))
+
+    for (let launch = 0; launch < 2; launch += 1) {
+      const { startBotRelay, stopBotRelay } = await loadRelay()
+
+      startBotRelay()
+      await pushAndSettle()
+      stopBotRelay()
+    }
+
+    const leased = calls.filter(call => ['bot_relay.outbox.drain', 'bot_relay.roster.sync'].includes(call.method))
+    const ids = new Set(leased.map(call => call.params.relay_id))
+
+    expect(new Set(leased.map(call => call.method)).size).toBe(2)
+    expect(ids.size).toBe(1)
+    expect([...ids][0]).toEqual(expect.any(String))
+    expect([...ids][0]).not.toBe('')
+  })
+})
+
 describe('stop halts both loops', () => {
   it('leaves no timer able to reach the gateway after teardown', async () => {
     const calls = respondWith(() => ({ envelopes: [] }))
@@ -759,7 +784,7 @@ describe('the roster loop forgets a machine that left', () => {
     await vi.advanceTimersByTimeAsync(60_000)
 
     const syncs = calls.filter(call => call.method === 'bot_relay.roster.sync')
-    expect(syncs).toEqual([expect.objectContaining({ connectionId: 'a', params: { agents: [] } })])
+    expect(syncs).toEqual([expect.objectContaining({ connectionId: 'a', params: expect.objectContaining({ agents: [] }) })])
 
     // Once, not on every tick.
     calls.length = 0
@@ -812,7 +837,7 @@ describe('the roster loop forgets a machine that left', () => {
     clearFails = false
     await vi.advanceTimersByTimeAsync(60_000)
     expect(calls.filter(call => call.method === 'bot_relay.roster.sync')).toEqual([
-      expect.objectContaining({ connectionId: 'a', params: { agents: [] } })
+      expect.objectContaining({ connectionId: 'a', params: expect.objectContaining({ agents: [] }) })
     ])
 
     // And once it lands it is spent, exactly as before.

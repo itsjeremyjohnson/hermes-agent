@@ -97,6 +97,39 @@ const relay: RelayLifecycle = {
   rosterTimer: null
 }
 
+// Each gateway lets one Desktop at a time sync its roster and drain its outbox
+// (tools/bot_relay.py claim_relay_lease): roster rows carry THIS Desktop's
+// connection ids, so a second Desktop writing the same gateway relabelled every
+// row each minute. The id persists across restarts so a relaunched Desktop keeps
+// its own lease instead of waiting it out. A gateway leased to another Desktop
+// rejects both calls, and the loops skip it like an older backend.
+const RELAY_ID_STORAGE_KEY = 'hermes-bots:relay-id'
+let relayIdCache = ''
+
+function relayId(): string {
+  if (relayIdCache) {
+    return relayIdCache
+  }
+
+  try {
+    relayIdCache = localStorage.getItem(RELAY_ID_STORAGE_KEY) || ''
+  } catch {
+    // No storage in this context: the id lives for the process only.
+  }
+
+  if (!relayIdCache) {
+    relayIdCache = crypto.randomUUID()
+
+    try {
+      localStorage.setItem(RELAY_ID_STORAGE_KEY, relayIdCache)
+    } catch {
+      // Same as above.
+    }
+  }
+
+  return relayIdCache
+}
+
 // Relay-route socket retention (#93594): connection id → release fn. While
 // the relay is active each registered connection's pooled socket is pinned
 // open (host.retainProfileSocket) so drain RPCs reuse ONE persistent
@@ -293,7 +326,10 @@ async function syncRelayRosters() {
         const cleared = await Promise.all(
           connections.map(async connection => {
             try {
-              await host.requestProfile(connection.route, 'bot_relay.roster.sync', { agents: [] })
+              await host.requestProfile(connection.route, 'bot_relay.roster.sync', {
+                agents: [],
+                relay_id: relayId()
+              })
 
               return true
             } catch {
@@ -356,10 +392,11 @@ async function syncRelayRosters() {
 
         try {
           await host.requestProfile(connection.route, 'bot_relay.roster.sync', {
-            agents: others
+            agents: others,
+            relay_id: relayId()
           })
         } catch {
-          // Older backend without the relay RPCs — skip this connection.
+          // Older backend without the relay RPCs, or another Desktop relays here — skip this connection.
         }
       })
     )
@@ -414,14 +451,14 @@ async function drainRelayOutboxes() {
         const res = await host.requestProfile<{ envelopes?: RelayEnvelope[] }>(
           sender.route,
           'bot_relay.outbox.drain',
-          {}
+          { relay_id: relayId() }
         )
 
         for (const envelope of Array.isArray(res?.envelopes) ? res.envelopes : []) {
           queued.push({ envelope, sender })
         }
       } catch {
-        // Older backend without the relay RPCs — skip this connection.
+        // Older backend without the relay RPCs, or another Desktop relays here — skip this connection.
       }
     }
 

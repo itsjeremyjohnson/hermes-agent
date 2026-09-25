@@ -6,7 +6,8 @@ no network; the Desktop owns every socket: ``roster.json`` (union roster of
 agents on OTHER connections, pushed via ``bot_relay.roster.sync``), ``outbox/``
 (envelopes queued by ``message_agent``, drained via ``bot_relay.outbox.drain``),
 ``replies/`` (one JSON per envelope via ``bot_relay.reply``; a waiter spawned at
-send time watches it so the reply wakes the sender like a local DM).
+send time watches it so the reply wakes the sender like a local DM), ``lease.json`` (which Desktop
+may sync and drain here; roster connection ids are that Desktop's own).
 Public helpers never raise, except ``enqueue_envelope`` → ``EnvelopeRefusedError``
 when the target is definitively offline (fail fast instead of queueing a DM nobody will drain).
 """
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 RELAY_DIR_NAME = "bot_relay"
 ROSTER_FILE = "roster.json"
+LEASE_FILE = "lease.json"
 OUTBOX_DIR = "outbox"
 CLAIMED_DIR = "claimed"
 REPLIES_DIR = "replies"
@@ -64,6 +66,12 @@ STALE_AFTER_SECONDS = 6 * 3600
 # Only a recent roster is authoritative for the fail-fast offline check: the
 # Desktop re-pushes roster.sync on connection-state changes.
 ROSTER_FRESH_SECONDS = 600
+# The relay Desktop renews its lease on every roster sync (60s) and drain (30s); a lease this stale
+# belongs to a Desktop that closed or lost its socket, and the next Desktop to call takes it over.
+RELAY_LEASE_STALE_SECONDS = 180
+# Turn-lock name serializing lease updates. Profile names start with an alphanumeric, so no profile
+# shares it.
+_LEASE_LOCK_NAME = "_relay_lease"
 
 
 class EnvelopeRefusedError(RuntimeError):
@@ -150,14 +158,56 @@ def _normalize_roster_row(row: Any) -> Optional[dict]:
     return out
 
 
-def write_remote_roster(root: Path | str, rows: Any) -> int:
-    """Atomically persist the Desktop-pushed remote roster. Returns count."""
+class RelayLeaseHeldError(RuntimeError):
+    """Another Desktop holds this gateway's relay lease; the caller must not sync or drain here."""
+
+    reason = "relay_not_owner"
+
+
+def relay_owner_id(value: Any) -> str:
+    """A Desktop's relay id as sent over RPC. Older Desktops send none; "" is their shared owner."""
+    return str(value or "").strip()[:128]
+
+
+def claim_relay_lease(root: Path | str, relay_id: Any) -> None:
+    """Take or renew this gateway's relay lease for ``relay_id``.
+
+    Each Desktop labels roster rows with its own connection ids, so one gateway's roster and outbox
+    must be served by one Desktop at a time. Raises :class:`RelayLeaseHeldError` while a different
+    Desktop's lease is fresher than ``RELAY_LEASE_STALE_SECONDS``."""
+    owner = relay_owner_id(relay_id)
+    path = _ensure_dirs(root) / LEASE_FILE
+    with acquire_turn_lock(root, _LEASE_LOCK_NAME, timeout_seconds=5):
+        now = time.time()
+        try:
+            lease = json.loads(path.read_text(encoding="utf-8"))
+            holder, renewed = str(lease["relay_id"]), float(lease["renewed_at"])
+        except (OSError, ValueError, TypeError, KeyError):
+            holder, renewed = owner, 0.0
+        if holder != owner and now - renewed <= RELAY_LEASE_STALE_SECONDS:
+            raise RelayLeaseHeldError(
+                f"another Desktop relays for this gateway (lease renewed {int(now - renewed)}s ago)")
+        _atomic_write_json(path, {"relay_id": owner, "renewed_at": now})
+
+
+def _roster_relay_id(root: Path | str) -> Optional[str]:
+    """Relay id of the Desktop that wrote the current roster; None for a legacy or missing roster."""
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        owner = json.loads((relay_root(root) / ROSTER_FILE).read_text(encoding="utf-8")).get("relay_id")
+        return owner if isinstance(owner, str) else None
+    return None
+
+
+def write_remote_roster(root: Path | str, rows: Any, relay_id: Any = "") -> int:
+    """Atomically persist the Desktop-pushed remote roster. Returns count. ``relay_id`` records
+    which Desktop's connection ids the rows use."""
     base = _ensure_dirs(root)
     by_key: dict[tuple[str, str], dict] = {}
     for norm in filter(None, map(_normalize_roster_row, rows if isinstance(rows, list) else [])):
         by_key.setdefault((norm["connection_id"], norm["profile"]), norm)
     cleaned = [by_key[k] for k in sorted(by_key)]
-    _atomic_write_json(base / ROSTER_FILE, {"updated_at": int(time.time()), "agents": cleaned}, sort_keys=True)
+    _atomic_write_json(base / ROSTER_FILE, {"updated_at": int(time.time()), "agents": cleaned,
+                                            "relay_id": relay_owner_id(relay_id)}, sort_keys=True)
     return len(cleaned)
 
 
@@ -305,8 +355,29 @@ def enqueue_envelope(root: Path | str, *, target: dict, message: str, sender_pro
         "target_connection": target["connection_id"], "target_profile": target["profile"],
         "target_handle": target["handle"], "message": message,
     }
+    # ``target_connection`` is an id from this Desktop's connection map; only it may deliver the envelope.
+    relay_id = _roster_relay_id(root)
+    if relay_id is not None:
+        envelope["relay_id"] = relay_id
     _atomic_write_json(base / OUTBOX_DIR / f"{envelope['id']}.json", envelope)
     return envelope
+
+
+def _refuse_if_other_relay(root: Path | str, envelope: dict, relay_id: str) -> bool:
+    """True when ``envelope`` was addressed with another Desktop's connection ids; writes a
+    'runtime_offline' reply so the sender resends against the current roster. Unstamped (pre-lease)
+    envelopes pass."""
+    stamped = envelope.get("relay_id")
+    if not isinstance(stamped, str) or stamped == relay_id:
+        return False
+    with contextlib.suppress(OSError, ValueError):
+        from tools.bot_failure_reasons import RUNTIME_OFFLINE
+
+        write_reply(root, str(envelope.get("id") or ""), reason=RUNTIME_OFFLINE, error=(
+            f"message to @{envelope.get('target_handle') or '?'} on {envelope.get('target_connection') or '?'} "
+            "was NOT delivered: a different Desktop now relays for this machine, and connection names differ "
+            "between Desktops. Resend it."))
+    return True
 
 
 def _expire_if_stale(root: Path | str, path: Path, ttl: float, now: float) -> bool:
@@ -338,9 +409,10 @@ def _queued_at(path: Path) -> tuple[float, str]:
     return (0.0, path.name)
 
 
-def claim_pending_envelopes(root: Path | str) -> list[dict]:
+def claim_pending_envelopes(root: Path | str, relay_id: Any = "") -> list[dict]:
     """Drain the outbox (rename → claimed/ so a second drain can't double-deliver).
-    TTL-expired envelopes get a 'queued_expired' reply and are removed instead.
+    TTL-expired envelopes get a 'queued_expired' reply and are removed instead. Envelopes addressed
+    under a Desktop other than ``relay_id`` get a 'runtime_offline' reply and are not handed out.
 
     Envelopes older than ``bot_mode.envelope_ttl_seconds`` are NOT delivered: each gets an error reply
     (reason ``'queued_expired'``) so the sender's waiter resolves, and its outbox file is removed (#93091
@@ -350,8 +422,9 @@ def claim_pending_envelopes(root: Path | str) -> list[dict]:
     _sweep_stale(base)
     ttl = _envelope_ttl_seconds()
     now = time.time()
+    owner = relay_owner_id(relay_id)
     # Re-offers first: they are the oldest mail this drain hands out.
-    out: list[dict] = _reoffer_unanswered(root, base, ttl, now)
+    out: list[dict] = _reoffer_unanswered(root, base, ttl, now, owner)
     # Oldest first: the Desktop delivers each target's claimed envelopes in the order this list
     # gives them, so a sender's two DMs to one agent arrive in the order they were sent. Sorting
     # by filename ordered them by ``uuid4().hex`` — at random.
@@ -367,11 +440,12 @@ def claim_pending_envelopes(root: Path | str) -> list[dict]:
             envelope = json.loads(claimed.read_text(encoding="utf-8"))
             if not isinstance(envelope, dict):
                 raise ValueError(f"expected a JSON object, got {type(envelope).__name__}")
-            out.append(envelope)
+            if not _refuse_if_other_relay(root, envelope, owner):
+                out.append(envelope)
     return out
 
 
-def _reoffer_unanswered(root: Path | str, base: Path, ttl: float, now: float) -> list[dict]:
+def _reoffer_unanswered(root: Path | str, base: Path, ttl: float, now: float, relay_id: str = "") -> list[dict]:
     """``claimed/`` envelopes unanswered ``REOFFER_AFTER_SECONDS`` after their claim, at most once each.
 
     The claim is the Desktop's: one that disconnects between ``outbox.drain`` and ``bot_relay.deliver``
@@ -406,7 +480,7 @@ def _reoffer_unanswered(root: Path | str, base: Path, ttl: float, now: float) ->
             if envelope.get("reoffered_at"):
                 continue
             queued_for = now - claimed_at - REOFFER_AFTER_SECONDS
-            if queued_for < 0:
+            if queued_for < 0 or _refuse_if_other_relay(root, envelope, relay_id):
                 continue
             if ttl > 0 and queued_for > ttl:
                 write_reply(root, env_id, reason="queued_expired", error=(

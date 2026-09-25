@@ -53,10 +53,15 @@ def _run_delivery(profile: str, tmp: str, env: dict | None = None, *,
 @method("bot_relay.roster.sync")
 def _(rid, params: dict, _root=_relay_root) -> dict:
     """Replace this gateway's view of agents on OTHER connections → ``{count}`` accepted rows
-    (``agents`` rows ``{profile, handle, connection_id, ...}``; invalid rows are dropped)."""
+    (``agents`` rows ``{profile, handle, connection_id, ...}``; invalid rows are dropped).
+    Refused with ``data.reason`` 'relay_not_owner' while another Desktop holds the relay lease."""
     try:
-        from tools.bot_relay import write_remote_roster
-        return _ok(rid, {"count": write_remote_roster(_root(), params.get("agents"))})
+        from tools.bot_relay import RelayLeaseHeldError, claim_relay_lease, write_remote_roster
+        root = _root()
+        claim_relay_lease(root, params.get("relay_id"))
+        return _ok(rid, {"count": write_remote_roster(root, params.get("agents"), params.get("relay_id"))})
+    except RelayLeaseHeldError as e:
+        return _err(rid, 4095, str(e), data={"reason": e.reason})
     except Exception as e:
         return _err(rid, 5090, str(e))
 
@@ -64,10 +69,15 @@ def _(rid, params: dict, _root=_relay_root) -> dict:
 @method("bot_relay.outbox.drain")
 def _(rid, params: dict, _root=_relay_root) -> dict:
     """Claim every pending cross-connection envelope queued here → ``{envelopes}``; claimed
-    envelopes move to ``claimed/`` atomically so concurrent drains can't double-deliver."""
+    envelopes move to ``claimed/`` atomically so concurrent drains can't double-deliver. Refused
+    like ``roster.sync`` while another Desktop holds the relay lease."""
     try:
-        from tools.bot_relay import claim_pending_envelopes
-        return _ok(rid, {"envelopes": claim_pending_envelopes(_root())})
+        from tools.bot_relay import RelayLeaseHeldError, claim_pending_envelopes, claim_relay_lease
+        root = _root()
+        claim_relay_lease(root, params.get("relay_id"))
+        return _ok(rid, {"envelopes": claim_pending_envelopes(root, params.get("relay_id"))})
+    except RelayLeaseHeldError as e:
+        return _err(rid, 4095, str(e), data={"reason": e.reason})
     except Exception as e:
         return _err(rid, 5091, str(e))
 
