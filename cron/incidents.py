@@ -6,8 +6,10 @@ operator every run once acknowledged. Lifecycle: ``detected`` â†’ ``alerted`` â†
 job + same normalized error resolves to the SAME incident id, so a closed incident stays closed
 until the error text changes and mints a new one. ``alerted`` means a failure ping actually reached
 the operator (``alerted_at`` = when the latest one did; the scheduler withholds repeats until
-``cron.failure_repeat_alert_hours`` have passed). Incidents share ``cron/executions.db`` with
-``cron.executions`` (one ledger file).
+``cron.failure_repeat_alert_hours`` have passed). ``undelivered_at`` means the latest failure ping
+provably did not arrive (send error, or a deferred Bot Chat notice that ended ``ambiguous``); a
+recovery that resolves such an incident sends one "never delivered" digest instead of closing it
+silently. Incidents share ``cron/executions.db`` with ``cron.executions`` (one ledger file).
 """
 
 from __future__ import annotations
@@ -88,6 +90,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     # Ledgers created before the alert-once gate lack ``alerted_at``; add it in place.
     add_column_if_missing(conn, "cron_incidents", "alerted_at", "alerted_at TEXT")
+    add_column_if_missing(conn, "cron_incidents", "undelivered_at", "undelivered_at TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_cron_incidents_job "
         "ON cron_incidents(job_id)"
@@ -176,6 +179,7 @@ def upsert_incident(
                    SET last_seen_at=?, error=?, output_file=?,
                        state=CASE WHEN state='resolved' THEN 'detected' ELSE state END,
                        alerted_at=CASE WHEN state='resolved' THEN NULL ELSE alerted_at END,
+                       undelivered_at=CASE WHEN state='resolved' THEN NULL ELSE undelivered_at END,
                        closed_at=CASE WHEN state='resolved' THEN NULL ELSE closed_at END
                    WHERE id=?""",
                 (now, stored_error, output_file, incident_id),
@@ -208,7 +212,7 @@ def set_incident_state(incident_id: str, state: str) -> bool:
             return False
         if state == "alerted":
             conn.execute(
-                "UPDATE cron_incidents SET state='alerted', alerted_at=? WHERE id=?",
+                "UPDATE cron_incidents SET state='alerted', alerted_at=?, undelivered_at=NULL WHERE id=?",
                 (now, incident_id),
             )
             return True
@@ -232,6 +236,44 @@ def set_incident_state(incident_id: str, state: str) -> bool:
 def ack_incident(incident_id: str) -> bool:
     """Acknowledge (close) an incident; ``False`` when missing or already closed."""
     return set_incident_state(incident_id, "closed")
+
+
+def record_alert_delivery(incident_ids, *, delivered: bool) -> None:
+    """Record the fate of a failure ping that settled after the run (a deferred Bot Chat notice or
+    the recovery digest). ``delivered`` stamps ``alerted_at`` and clears ``undelivered_at``; only a
+    ``detected`` incident moves to ``alerted``, so a late receipt never re-opens a ``resolved`` one
+    or touches an operator ``closed`` ack. Otherwise ``undelivered_at`` is stamped."""
+    ids = [str(i) for i in incident_ids or () if i]
+    if not ids:
+        return
+    now = _hermes_now().isoformat()
+    marks = ",".join("?" * len(ids))
+    with _transaction() as conn:
+        if delivered:
+            conn.execute(
+                f"""UPDATE cron_incidents
+                    SET alerted_at=?, undelivered_at=NULL,
+                        state=CASE WHEN state='detected' THEN 'alerted' ELSE state END
+                    WHERE id IN ({marks}) AND state != 'closed'""",
+                (now, *ids),
+            )
+        else:
+            conn.execute(
+                f"UPDATE cron_incidents SET undelivered_at=? WHERE id IN ({marks}) AND state != 'closed'",
+                (now, *ids),
+            )
+
+
+def undelivered_open_incidents(job_id: str) -> List[Dict[str, Any]]:
+    """Open incidents for ``job_id`` whose latest failure ping never arrived (``undelivered_at``)."""
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT * FROM cron_incidents
+               WHERE job_id=? AND state IN ('detected', 'alerted') AND undelivered_at IS NOT NULL
+               ORDER BY first_seen_at""",
+            (str(job_id or ""),),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def close_incidents_for_recovered_job(job_id: str) -> int:

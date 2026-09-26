@@ -384,11 +384,16 @@ def _upsert_incident_for_failure(
 
 def _resolve_incidents_for_recovered_job(job: dict) -> None:
     """Best-effort: a successful run marks the job's open incidents ``resolved`` (never touches an
-    operator ``closed`` ack). Store errors log at debug; delivery is unaffected."""
+    operator ``closed`` ack). Incidents whose failure ping never arrived are stashed on the job as
+    ``_undelivered_incidents`` so the run sends one digest (``_deliver_undelivered_digest``) instead
+    of closing them silently. Store errors log at debug; delivery is unaffected."""
     try:
-        from cron.incidents import close_incidents_for_recovered_job
+        from cron.incidents import close_incidents_for_recovered_job, undelivered_open_incidents
 
+        undelivered = undelivered_open_incidents(job["id"])
         close_incidents_for_recovered_job(job["id"])
+        if undelivered:
+            job["_undelivered_incidents"] = undelivered
     except Exception as exc:
         logger.debug("Incident store unavailable for job %s (delivery unaffected): %s", job["id"], exc)
 
@@ -403,6 +408,72 @@ def _mark_incident_alerted(incident_id: Optional[str]) -> None:
         set_incident_state(incident_id, "alerted")
     except Exception as exc:
         logger.debug("Failed marking incident %s alerted: %s", incident_id, exc)
+
+
+def _mark_incident_undelivered(incident_id: Optional[str]) -> None:
+    """Best-effort: the failure ping for this incident provably did not arrive."""
+    if not incident_id:
+        return
+    try:
+        from cron.incidents import record_alert_delivery
+
+        record_alert_delivery([incident_id], delivered=False)
+    except Exception as exc:
+        logger.debug("Failed marking incident %s undelivered: %s", incident_id, exc)
+
+
+def _undelivered_digest_text(job: dict, incidents: list) -> str:
+    name = job.get("name") or job["id"]
+    lines = [
+        f"Cron job '{name}' ({job['id']}) has recovered, but its earlier failure "
+        f"{'alert was' if len(incidents) == 1 else 'alerts were'} never delivered:",
+    ]
+    for inc in incidents:
+        seen = str(inc.get("first_seen_at") or "")[:16].replace("T", " ")
+        last = str(inc.get("last_seen_at") or "")[:16].replace("T", " ")
+        span = seen if seen == last else f"{seen} to {last}"
+        lines.append(f"- {span}: {str(inc.get('error') or 'unknown error').strip()}")
+    lines.append("Run `hermes cron runs` for the saved output.")
+    return "\n".join(lines)
+
+
+def _deliver_undelivered_digest(job: dict, fence: "_FireOwnership", *, adapters, loop) -> None:
+    """Send one failure-lane notice for incidents this recovery resolved whose ping never arrived.
+
+    A fresh notice under its own delivery id, never a replay of the lost one: an ``ambiguous``
+    Bot Chat turn may have run, and replaying it could run it twice. Best-effort; the run's own
+    delivery and status are unaffected."""
+    incidents = job.pop("_undelivered_incidents", None)
+    if not incidents:
+        return
+    ids = [inc["id"] for inc in incidents]
+    digest_job = {k: v for k, v in job.items()
+                  if k not in ("_bot_chat_delivery_receipts", "_notification_all_targets_suppressed")}
+    digest_job["execution_id"] = f"{job.get('execution_id') or ''}:undelivered-digest"
+    digest_job["_failure_incident_ids"] = ids
+    try:
+        with fence.side_effect_fence() as owns:
+            if not owns:
+                return
+            error = _deliver_result(digest_job, _undelivered_digest_text(job, incidents),
+                                    adapters=adapters, loop=loop, for_failure=True)
+    except Exception as exc:
+        logger.warning("Job '%s': undelivered-alert digest failed: %s", job["id"], exc)
+        return
+    if error:
+        logger.warning("Job '%s': undelivered-alert digest failed: %s", job["id"], error)
+        return
+    receipts = digest_job.get("_bot_chat_delivery_receipts", {}).values()
+    if any(r.get("status") in ("queued", "claimed") for r in receipts):
+        return  # the Bot Chat drain records the outcome
+    if digest_job.get("_notification_all_targets_suppressed"):
+        return
+    try:
+        from cron.incidents import record_alert_delivery
+
+        record_alert_delivery(ids, delivered=True)
+    except Exception as exc:
+        logger.debug("Failed recording digest delivery for job %s: %s", job["id"], exc)
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -2977,6 +3048,9 @@ def _save_compose_deliver(
     ) = _compose_run_delivery(
         job, success=d.success, error=d.error, final_response=final_response,
         output_file=output_file, agent_declared=d.agent_declared)
+    _deliver_undelivered_digest(job, fence, adapters=adapters, loop=loop)
+    # A deferred Bot Chat record snapshots the job, so the drain can settle this incident later.
+    job["_failure_incident_ids"] = [d.failure_incident_id] if d.failure_incident_id and not d.success else []
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
     if d.should_deliver and not d.success and job.get("_model_unreachable"):
@@ -3116,9 +3190,12 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         incident_acked=d.incident_acked,
         success=d.success,
     )
+    job.pop("_failure_incident_ids", None)
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
+    elif delivery_outcome == "failed" and not d.success:
+        _mark_incident_undelivered(d.failure_incident_id)
     finish_execution(
         execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
     return True
@@ -3131,6 +3208,20 @@ def _deliver_crash_failure(
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
+    job["_failure_incident_ids"] = [failure_incident_id] if failure_incident_id else []
+    error, outcome = _deliver_crash_failure_notice(
+        job, err_text, normalized_deliver, incident_acked, adapters=adapters, loop=loop)
+    job.pop("_failure_incident_ids", None)
+    if outcome in ("delivered", "not_configured"):
+        _mark_incident_alerted(failure_incident_id)
+    elif outcome == "failed":
+        _mark_incident_undelivered(failure_incident_id)
+    return error, outcome
+
+
+def _deliver_crash_failure_notice(
+    job: dict, err_text: str, normalized_deliver: str, incident_acked: bool, *, adapters, loop,
+) -> tuple[Optional[str], str]:
     if job.get("failure_alert_cooldown_seconds") is not None:
         from cron import failure_alerts
 
@@ -3143,8 +3234,6 @@ def _deliver_crash_failure(
         error, outcome, _attempted = failure_alerts._deliver_cooldown_failure(
             job, _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
             adapters=adapters, loop=loop, suppression=suppression)
-        if outcome in ("delivered", "not_configured"):
-            _mark_incident_alerted(failure_incident_id)
         return error, outcome
     if incident_acked:
         return None, "suppressed_acked"
@@ -3172,8 +3261,6 @@ def _deliver_crash_failure(
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"),
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
-    if delivery_outcome in ("delivered", "not_configured"):
-        _mark_incident_alerted(failure_incident_id)
     return delivery_error, delivery_outcome
 
 

@@ -142,6 +142,14 @@ def _drain(root: Path) -> None:
         record.update(status=status, error=error)
         # A transferred live-owner receipt remains authoritative, including queued.
         atomic_json_write(path, record, fsync_dir=True, mode=0o600)
+        if record.get("for_failure") and status != "suppressed":
+            # The run finished as "queued", so only this drain learns whether the operator was told.
+            try:
+                from cron.incidents import record_alert_delivery
+                record_alert_delivery(job.get("_failure_incident_ids"),
+                                      delivered=status in ("settled", "transferred"))
+            except Exception as exc:
+                logger.debug("Failed recording incident delivery for %s: %s", record["id"], exc)
 
 
 def drain_in_background() -> None:
