@@ -803,7 +803,7 @@ class TestSend:
 
     @pytest.mark.asyncio
     async def test_with_typing_card_patches_instead_of_creating(self, adapter):
-        adapter._typing_messages["spaces/S"] = "spaces/S/messages/THINK"
+        adapter._typing_messages[("spaces/S", "spaces/S/threads/T")] = "spaces/S/messages/THINK"
         adapter._patch_message = AsyncMock(
             return_value=type("R", (), {"success": True,
                                         "message_id": "spaces/S/messages/THINK",
@@ -821,7 +821,7 @@ class TestSend:
         # base class's _keep_typing loop cannot post a fresh marker that
         # the cleanup pass would later delete and tombstone.
         from plugins.platforms.google_chat.adapter import _TYPING_CONSUMED_SENTINEL
-        assert adapter._typing_messages["spaces/S"] == _TYPING_CONSUMED_SENTINEL
+        assert adapter._typing_messages[("spaces/S", "spaces/S/threads/T")] == _TYPING_CONSUMED_SENTINEL
 
 
     @pytest.mark.asyncio
@@ -861,6 +861,42 @@ class TestSend:
 
 class TestTypingLifecycle:
 
+    @pytest.mark.asyncio
+    async def test_concurrent_threads_keep_replies_in_their_own_thread(self, adapter):
+        posts = {}
+
+        async def create(chat_id, body):
+            name = f"{chat_id}/messages/{len(posts) + 1}"
+            posts[name] = {
+                "thread": (body.get("thread") or {}).get("name"),
+                "text": body["text"],
+            }
+            return type("Result", (), {"success": True, "message_id": name})()
+
+        async def patch(name, body):
+            posts[name]["text"] = body["text"]
+            return type("Result", (), {"success": True, "message_id": name})()
+
+        adapter._create_message = create
+        adapter._patch_message = patch
+        thread_a = {"thread_id": "spaces/S/threads/A"}
+        thread_b = {"thread_id": "spaces/S/threads/B"}
+
+        await adapter.send_typing("spaces/S", metadata=thread_a)
+        await adapter.send_typing("spaces/S", metadata=thread_b)
+        await adapter.send("spaces/S", "Answer for B", metadata=thread_b)
+        event_b = MagicMock()
+        event_b.source.chat_id = "spaces/S"
+        event_b.source.thread_id = "spaces/S/threads/B"
+        await adapter.on_processing_complete(event_b, ProcessingOutcome.SUCCESS)
+        await adapter.send("spaces/S", "Answer for A", metadata=thread_a)
+
+        assert sorted((post["thread"], post["text"]) for post in posts.values()
+                      if post["text"].startswith("Answer for ")) == [
+            ("spaces/S/threads/A", "Answer for A"),
+            ("spaces/S/threads/B", "Answer for B"),
+        ]
+
 
     @pytest.mark.asyncio
     async def test_send_typing_concurrent_calls_create_only_one_card(self, adapter):
@@ -898,7 +934,7 @@ class TestTypingLifecycle:
         await asyncio.gather(t1, t2)
 
         assert call_count == 1
-        assert adapter._typing_messages["spaces/S"] == "spaces/S/messages/CARD_1"
+        assert adapter._typing_messages[("spaces/S", None)] == "spaces/S/messages/CARD_1"
 
     @pytest.mark.asyncio
     async def test_send_typing_survives_caller_cancellation(self, adapter):
@@ -937,10 +973,10 @@ class TestTypingLifecycle:
         # Give the background task time to complete + record.
         for _ in range(20):
             await asyncio.sleep(0.05)
-            if "spaces/S" in adapter._typing_messages:
+            if ("spaces/S", None) in adapter._typing_messages:
                 break
         # Slot SHOULD be populated despite the cancellation.
-        assert adapter._typing_messages.get("spaces/S") == "spaces/S/messages/CARD_X"
+        assert adapter._typing_messages.get(("spaces/S", None)) == "spaces/S/messages/CARD_X"
 
     @pytest.mark.asyncio
     async def test_orphan_typing_cards_reaped_on_completion(self, adapter):
@@ -950,11 +986,11 @@ class TestTypingLifecycle:
         orphan to a benign marker so users don't see stuck
         'Hermes is thinking…' messages."""
         from plugins.platforms.google_chat.adapter import _TYPING_CONSUMED_SENTINEL
-        adapter._orphan_typing_messages["spaces/S"] = [
+        adapter._orphan_typing_messages[("spaces/S", None)] = [
             "spaces/S/messages/ORPHAN1",
             "spaces/S/messages/ORPHAN2",
         ]
-        adapter._typing_messages["spaces/S"] = _TYPING_CONSUMED_SENTINEL
+        adapter._typing_messages[("spaces/S", None)] = _TYPING_CONSUMED_SENTINEL
         adapter._patch_message = AsyncMock(
             return_value=type("R", (), {"success": True,
                                         "message_id": "x",
@@ -963,6 +999,8 @@ class TestTypingLifecycle:
         event = MagicMock()
         event.source = MagicMock()
         event.source.chat_id = "spaces/S"
+        event.source.thread_id = None
+        event.raw_message = {}
         await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
         # Both orphans patched (typing_messages cleared too).
         assert adapter._patch_message.await_count == 2
@@ -971,21 +1009,21 @@ class TestTypingLifecycle:
         ]
         assert "spaces/S/messages/ORPHAN1" in patched_ids
         assert "spaces/S/messages/ORPHAN2" in patched_ids
-        assert "spaces/S" not in adapter._orphan_typing_messages
+        assert ("spaces/S", None) not in adapter._orphan_typing_messages
 
     @pytest.mark.asyncio
     async def test_stop_typing_is_noop_for_live_card(self, adapter):
         """Anti-tombstone: stop_typing leaves a real msg_id in place so
         send() can patch it. Deleting would create a "Message deleted by
         its author" tombstone."""
-        adapter._typing_messages["spaces/S"] = "spaces/S/messages/THINK"
+        adapter._typing_messages[("spaces/S", None)] = "spaces/S/messages/THINK"
         delete_mock = MagicMock()
         delete_mock.return_value.execute = MagicMock(return_value={})
         adapter._chat_api.spaces.return_value.messages.return_value.delete = delete_mock
 
         await adapter.stop_typing("spaces/S")
         # Slot retained, no API delete fired.
-        assert adapter._typing_messages["spaces/S"] == "spaces/S/messages/THINK"
+        assert adapter._typing_messages[("spaces/S", None)] == "spaces/S/messages/THINK"
         delete_mock.assert_not_called()
 
 
@@ -993,7 +1031,7 @@ class TestTypingLifecycle:
     async def test_on_processing_complete_patches_stranded_card(self, adapter):
         """CANCELLED path: send() never ran. Patch the typing card with a
         benign final state instead of deleting (no tombstone)."""
-        adapter._typing_messages["spaces/S"] = "spaces/S/messages/THINK"
+        adapter._typing_messages[("spaces/S", None)] = "spaces/S/messages/THINK"
         adapter._patch_message = AsyncMock(
             return_value=type("R", (), {"success": True,
                                         "message_id": "spaces/S/messages/THINK",
@@ -1002,12 +1040,14 @@ class TestTypingLifecycle:
         event = MagicMock()
         event.source = MagicMock()
         event.source.chat_id = "spaces/S"
+        event.source.thread_id = None
+        event.raw_message = {}
         await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
         adapter._patch_message.assert_awaited_once()
         # Patched with a final-state label, not deleted.
         args, kwargs = adapter._patch_message.call_args
         assert "interrupted" in args[1]["text"].lower()
-        assert "spaces/S" not in adapter._typing_messages
+        assert ("spaces/S", None) not in adapter._typing_messages
 
 
 # ===========================================================================
@@ -1868,4 +1908,3 @@ class TestGoogleChatStandaloneSend:
         assert url == "https://chat.googleapis.com/v1/spaces/AAAA-BBBB/messages"
         assert kwargs["headers"]["Authorization"] == "Bearer the-token"
         assert kwargs["json"] == {"text": "hello cron"}
-

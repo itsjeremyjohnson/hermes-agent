@@ -550,18 +550,18 @@ class GoogleChatAdapter(BasePlatformAdapter):
         self._last_sender_by_chat: Dict[str, str] = {}
         self._dedup = MessageDeduplicator()
         self._shutting_down = False
-        self._typing_messages: Dict[str, str] = {}
+        self._typing_messages: Dict[Tuple[str, Optional[str]], str] = {}
         self._clarify_state, self._rate_limit_hits = {}, {}
         # Last inbound thread per space: DMs get a NEW thread per top-level message but users
         # see one conversation, so thread_id leaves the source (stable session key) and is cached here.
         self._last_inbound_thread: Dict[str, str] = {}
         from hermes_constants import get_hermes_home as _get_hermes_home
         self._thread_count_store = _ThreadCountStore(_get_hermes_home() / "google_chat_thread_counts.json")
-        # In-flight typing-card creates per chat_id: reserved BEFORE the API call so
-        # concurrent _keep_typing calls wait instead of duplicating cards.
-        self._typing_card_inflight: Dict[str, asyncio.Event] = {}
+        # Reserve each space/thread slot BEFORE the API call so concurrent
+        # _keep_typing calls in one thread wait without blocking other threads.
+        self._typing_card_inflight: Dict[Tuple[str, Optional[str]], asyncio.Event] = {}
         # Typing cards that lost a race with send(); patched away at end of turn.
-        self._orphan_typing_messages: Dict[str, List[str]] = {}
+        self._orphan_typing_messages: Dict[Tuple[str, Optional[str]], List[str]] = {}
         # Snapshot profile-scoped settings now: Pub/Sub callbacks run on threads
         # where the ContextVar secret scope is unavailable.
         extra = self.config.extra
@@ -1339,6 +1339,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
         patched in place (delete would leave a "Message deleted" tombstone) with the first
         chunk, further chunks are new messages; ``_keep_typing`` is paused meanwhile."""
         thread_id = self._resolve_thread_id(reply_to, metadata, chat_id=chat_id)
+        typing_key = (chat_id, thread_id)
         self.pause_typing_for_chat(chat_id)
         try:
             # Format BEFORE chunking so the size limit applies to the rendered form.
@@ -1346,7 +1347,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
             if not chunks:
                 return SendResult(success=False, error="empty message")
             last_result: Optional[SendResult] = None
-            typing_msg_name = self._typing_messages.pop(chat_id, None)
+            typing_msg_name = self._typing_messages.pop(typing_key, None)
             if typing_msg_name == _TYPING_CONSUMED_SENTINEL:
                 typing_msg_name = None
             patched_typing = False
@@ -1388,7 +1389,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
             # Sentinel keeps a trailing _keep_typing tick from posting a fresh marker that
             # stop_typing would then delete and tombstone. Cleared in on_processing_complete.
             if patched_typing:
-                self._typing_messages[chat_id] = _TYPING_CONSUMED_SENTINEL
+                self._typing_messages[typing_key] = _TYPING_CONSUMED_SENTINEL
             return last_result
         finally:
             self.resume_typing_for_chat(chat_id)
@@ -1575,43 +1576,45 @@ class GoogleChatAdapter(BasePlatformAdapter):
         ``wait_for(timeout=1.5)``: a cancelled create would still land an unrecorded card and
         the next tick would create a second, so the slot is reserved with an in-flight Event
         and the create runs in a shielded task that records the msg_id regardless."""
-        # Already have a card (real msg_id, sentinel, or in-flight) — bail.
-        if chat_id in self._typing_messages:
+        thread_id = self._resolve_thread_id(reply_to=None, metadata=metadata, chat_id=chat_id)
+        typing_key = (chat_id, thread_id)
+        # Already have a card (real msg_id, sentinel, or in-flight) in this thread.
+        if typing_key in self._typing_messages:
             return
-        if chat_id in self._typing_card_inflight:
+        if typing_key in self._typing_card_inflight:
             # Bounded wait for the running create so "the card is up when we return".
             with contextlib.suppress(asyncio.TimeoutError, KeyError):
-                await asyncio.wait_for(self._typing_card_inflight[chat_id].wait(), timeout=5.0)
+                await asyncio.wait_for(self._typing_card_inflight[typing_key].wait(), timeout=5.0)
             return
-        thread_id = self._resolve_thread_id(reply_to=None, metadata=metadata, chat_id=chat_id)
         body = _thread_body(getattr(self.config, "typing_status_text", None) or "Hermes is thinking…", thread_id)
-        self._typing_card_inflight[chat_id] = completed = asyncio.Event()
+        self._typing_card_inflight[typing_key] = completed = asyncio.Event()
 
         async def _create_and_record() -> None:
             try:
                 result = await self._create_message(chat_id, body)
                 if result.success and result.message_id:
-                    if chat_id not in self._typing_messages:
-                        self._typing_messages[chat_id] = result.message_id
+                    if typing_key not in self._typing_messages:
+                        self._typing_messages[typing_key] = result.message_id
                     else:
                         # send() or another create claimed the slot first: orphan;
                         # on_processing_complete cleans it up.
-                        self._orphan_typing_messages.setdefault(chat_id, []).append(result.message_id)
+                        self._orphan_typing_messages.setdefault(typing_key, []).append(result.message_id)
             except Exception:
                 logger.debug("[GoogleChat] send_typing background create failed", exc_info=True)
             finally:
-                self._typing_card_inflight.pop(chat_id, None)
+                self._typing_card_inflight.pop(typing_key, None)
                 completed.set()
 
         # The shielded task keeps running if our awaiter is cancelled.
         await asyncio.shield(asyncio.create_task(_create_and_record()))
 
-    async def stop_typing(self, chat_id: str) -> None:
+    async def stop_typing(self, chat_id: str, metadata: Any = None) -> None:
         """NO-OP for a live card: upstream calls ``stop_typing`` BEFORE ``send()`` patches it
         (deleting would tombstone). Only the SENTINEL is popped so the next turn starts clean;
         stranded cards are reaped by ``on_processing_complete``."""
-        if self._typing_messages.get(chat_id) == _TYPING_CONSUMED_SENTINEL:
-            self._typing_messages.pop(chat_id, None)
+        typing_key = (chat_id, self._resolve_thread_id(None, metadata, chat_id=chat_id))
+        if self._typing_messages.get(typing_key) == _TYPING_CONSUMED_SENTINEL:
+            self._typing_messages.pop(typing_key, None)
 
     async def _patch_quietly(self, message_name: str, text: str, log_msg: str, *log_args: Any) -> None:
         try:
@@ -1626,28 +1629,35 @@ class GoogleChatAdapter(BasePlatformAdapter):
         if event.source is None:
             return
         chat_id = event.source.chat_id
+        thread_id = getattr(event.source, "thread_id", None)
+        if thread_id is None and isinstance(event.raw_message, dict):
+            thread_id = (event.raw_message.get("thread") or {}).get("name")
+        typing_key = (chat_id, thread_id)
         try:
-            current = self._typing_messages.pop(chat_id, None)
+            current = self._typing_messages.pop(typing_key, None)
             if current and current != _TYPING_CONSUMED_SENTINEL:
                 label = "(interrupted)" if outcome == ProcessingOutcome.CANCELLED else "(no reply)"
                 await self._patch_quietly(current, label, "[GoogleChat] on_processing_complete patch fallback failed")
-            for orphan_id in self._orphan_typing_messages.pop(chat_id, []):
+            for orphan_id in self._orphan_typing_messages.pop(typing_key, []):
                 await self._patch_quietly(orphan_id, "·", "[GoogleChat] orphan typing-card patch failed: %s", orphan_id)
         except Exception:
             logger.debug("[GoogleChat] cleanup in on_processing_complete failed", exc_info=True)
 
     # -- attachments ---------------------------------------------------------
-    async def _consume_typing_card_with_text(self, chat_id: str, text: str) -> Optional[SendResult]:
+    async def _consume_typing_card_with_text(
+        self, chat_id: str, text: str, thread_id: Optional[str] = None,
+    ) -> Optional[SendResult]:
         """Patch the tracked typing card with ``text`` (no tombstone); None when there is no
         real card (caller creates a message) — the SENTINEL stays so ``_keep_typing`` doesn't
         post a fresh card during a subsequent attachment send. Raises transient HttpErrors."""
-        current = self._typing_messages.get(chat_id)
+        typing_key = (chat_id, thread_id)
+        current = self._typing_messages.get(typing_key)
         if not current or current == _TYPING_CONSUMED_SENTINEL:
             return None
-        self._typing_messages.pop(chat_id, None)
+        self._typing_messages.pop(typing_key, None)
         try:
             result = await self._patch_message(current, {"text": text})
-            self._typing_messages[chat_id] = _TYPING_CONSUMED_SENTINEL
+            self._typing_messages[typing_key] = _TYPING_CONSUMED_SENTINEL
             return result
         except HttpError as exc:
             if _http_status(exc) == 404:
@@ -1662,7 +1672,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
         thread_id = self._resolve_thread_id(reply_to, metadata, chat_id=chat_id)
         text = "\n".join(([caption] if caption else []) + [image_url])
         try:
-            patched = await self._consume_typing_card_with_text(chat_id, text)
+            patched = await self._consume_typing_card_with_text(chat_id, text, thread_id)
             if patched is not None:
                 return patched
             return await self._create_message(chat_id, _thread_body(text, thread_id))
@@ -1785,7 +1795,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
         if chat_api is None:
             return await self._post_attachment_fallback(chat_id, path, filename, caption, thread_id)
         try:
-            await self._consume_typing_card_with_text(chat_id, caption or " ")
+            await self._consume_typing_card_with_text(chat_id, caption or " ", thread_id)
         except Exception:
             logger.debug("[GoogleChat] _send_file pre-patch typing-card failed", exc_info=True)
 
