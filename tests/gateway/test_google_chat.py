@@ -862,6 +862,45 @@ class TestSend:
 class TestTypingLifecycle:
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("space_type,reply_off,expected_thread", [
+        ("DIRECT_MESSAGE", False, None),
+        ("SPACE", True, None),
+        ("SPACE", False, "spaces/S/threads/T1"),
+    ])
+    async def test_completion_reaps_card_at_delivery_thread(
+        self, adapter, space_type, reply_off, expected_thread,
+    ):
+        env = _make_chat_envelope(thread_name="spaces/S/threads/T1")
+        payload = env["chat"]["messagePayload"]
+        payload["space"]["spaceType"] = space_type
+        payload["message"]["space"]["spaceType"] = space_type
+        if reply_off:
+            adapter._source_parity_access = True
+            adapter._reply_to_mode = "off"
+        event = await adapter._build_message_event(payload["message"], env)
+        posts = {}
+
+        async def create(chat_id, body):
+            name = f"{chat_id}/messages/THINK"
+            posts[name] = dict(body)
+            return types.SimpleNamespace(success=True, message_id=name)
+
+        async def patch(name, body):
+            posts[name].update(body)
+            return types.SimpleNamespace(success=True, message_id=name)
+
+        adapter._create_message = create
+        adapter._patch_message = patch
+        metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        await adapter.send_typing(event.source.chat_id, metadata=metadata)
+        await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+
+        expected = {"text": "(interrupted)"}
+        if expected_thread:
+            expected["thread"] = {"name": expected_thread}
+        assert posts["spaces/S/messages/THINK"] == expected
+
+    @pytest.mark.asyncio
     async def test_concurrent_threads_keep_replies_in_their_own_thread(self, adapter):
         posts = {}
 

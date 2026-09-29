@@ -1630,8 +1630,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
             return
         chat_id = event.source.chat_id
         thread_id = getattr(event.source, "thread_id", None)
-        if thread_id is None and isinstance(event.raw_message, dict):
-            thread_id = (event.raw_message.get("thread") or {}).get("name")
+        if thread_id:
+            thread_id = self._resolve_thread_id(None, {"thread_id": thread_id}, chat_id=chat_id)
         typing_key = (chat_id, thread_id)
         try:
             current = self._typing_messages.pop(typing_key, None)
