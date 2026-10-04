@@ -224,11 +224,11 @@ def has_named_custom_provider(requested_provider: str) -> bool:
         return False
 
 
-def codex_model_provider_id(requested_provider: str) -> Optional[str]:
-    """Codex ``[model_providers.<id>]`` key for a configured named custom provider — its ``custom:``
-    identity without the prefix (the ``providers:`` config key; legacy ``custom_providers:`` entries
-    use their normalized display name). None for bare ``custom``, aliases that resolve to custom
-    (ollama, vllm, …) and unknown names: codex has no stable id to look up for those (#75186)."""
+def named_custom_provider_slug(requested_provider: str) -> Optional[str]:
+    """``custom:<name>`` identity of the configured entry a request selects, in any spelling the
+    resolver accepts (``custom:<key>``, the bare key, the display name): the ``providers:`` config
+    key, or a legacy ``custom_providers:`` entry's normalized display name. None for bare ``custom``,
+    aliases that resolve to custom (ollama, vllm, …) and unknown names."""
     if _normalize_custom_provider_name(requested_provider or "") in {"", "custom"}:
         return None
     try:
@@ -237,7 +237,16 @@ def codex_model_provider_id(requested_provider: str) -> Optional[str]:
         return None
     if not entry:
         return None
-    return custom_provider_slug(str(entry.get("name") or ""), str(entry.get("provider_key") or "")).split(":", 1)[1] or None
+    slug = custom_provider_slug(str(entry.get("name") or ""), str(entry.get("provider_key") or ""))
+    return slug if slug.split(":", 1)[1] else None
+
+
+def codex_model_provider_id(requested_provider: str) -> Optional[str]:
+    """Codex ``[model_providers.<id>]`` key for a configured named custom provider: its
+    :func:`named_custom_provider_slug` without the prefix. Codex has no stable id to look up for
+    anything else (#75186)."""
+    slug = named_custom_provider_slug(requested_provider)
+    return slug.split(":", 1)[1] if slug else None
 
 
 # ── identity recovery (bare "custom" -> durable ``custom:<name>``) ─────────────────────────
