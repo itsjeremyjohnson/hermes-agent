@@ -579,10 +579,7 @@ class TestPersistence:
         # never the saved endpoint with the new key.
         (_NAMED, "custom:cliproxyapi", ("http://cliproxy-b.example:8317/v1", "sk-cliproxy-b"),
          ("custom", "http://cliproxy-b.example:8317/v1", "sk-cliproxy-b")),
-        # A bare entry name selects the same entry; the shared endpoint cannot tell the accounts apart.
-        (_SHARED_ENDPOINT.replace("provider: custom:account-a", "provider: account-a"), "custom:account-a", None,
-         ("custom", "https://proxy.example/v1", "sk-account-a")),
-    ], ids=["unchanged", "entry_moved", "bare_entry_name"])
+    ], ids=["unchanged", "entry_moved"])
     def test_named_custom_provider_round_trips(self, tmp_path, monkeypatch, config, persisted, moved_to, expected):
         """A session on a named custom provider stores its ``custom:<name>`` identity, not the bare
         ``custom`` it resolves to, so a restart restores that entry's endpoint and key."""

@@ -355,18 +355,11 @@ class SessionManager:
             value = getattr(state.agent, key, None)
             if isinstance(value, str) and value.strip():
                 session_meta[key] = value.strip()
-        # A named custom provider resolves to the bare "custom" billing class; persist the selected
-        # entry's ``custom:<name>`` instead, whichever spelling selected it, so restore resolves that
-        # entry and its key directly.
-        if session_meta.get("provider") == "custom":
-            try:
-                from hermes_cli.runtime_provider_custom import named_custom_provider_slug
-                slug = named_custom_provider_slug(str(getattr(state.agent, "requested_provider", None) or ""))
-            except Exception:
-                logger.debug("custom provider identity lookup failed", exc_info=True)
-                slug = None
-            if slug:
-                session_meta["provider"] = slug
+        # A named custom provider resolves to the bare "custom" billing class; persist the requested
+        # ``custom:<name>`` instead so restore resolves that entry and its key directly.
+        requested = str(getattr(state.agent, "requested_provider", None) or "").strip()
+        if session_meta.get("provider") == "custom" and requested.startswith("custom:") and requested[7:].strip():
+            session_meta["provider"] = requested
 
         try:
             if db.get_session(state.session_id) is None:
