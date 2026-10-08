@@ -621,3 +621,77 @@ class TestAuxInheritsCustomProviderExtraBody:
         # A custom endpoint no entry describes gets nothing.
         stray = _build_call_kwargs("custom", "some-model", msgs, base_url="https://stray.example/v1")
         assert "user" not in (stray.get("extra_body") or {})
+
+
+class TestCustomPrefixedNamedProviderWithBaseUrl:
+    """``auxiliary.<task>: {provider: custom:<name>, base_url: <the entry's own URL>}`` must send the
+    named entry's key_cmd bearer, not ``no-key-required``. The vision chain re-enters
+    ``_resolve_task_provider_model`` with provider+base_url explicit, which collapsed ``custom:<name>``
+    to bare ``custom`` (no key lookup) and 401'd every ``vision_analyze`` call."""
+
+    @pytest.fixture
+    def stub(self):
+        """Local OpenAI-compatible endpoint that records each request's Authorization header."""
+        import http.server
+        import threading
+
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(self.headers.get("Authorization"))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                body = json.dumps({
+                    "id": "c1", "object": "chat.completion", "created": 0, "model": "m",
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": "ok"}}],
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield f"http://127.0.0.1:{server.server_address[1]}/v1", seen
+        server.shutdown()
+        server.server_close()
+
+    @staticmethod
+    def _cfg(entry_url, task_url):
+        import sys
+        return {
+            "model": {"provider": "custom:proxy", "default": "main-model"},
+            "providers": {"proxy": {"api": entry_url,
+                                    "key_cmd": f'"{sys.executable}" -c "print(\'vk-proxy-1234\')"'}},
+            "auxiliary": {"vision": {"provider": "custom:proxy", "model": "vis-model", "base_url": task_url}},
+        }
+
+    @pytest.mark.parametrize("call", ["async_vision", "sync_vision", "sync_explicit_args"])
+    def test_named_entry_key_cmd_reaches_the_wire(self, tmp_path, stub, call):
+        import asyncio
+        from agent import auxiliary_client as ac
+        url, seen = stub
+        _write_config(tmp_path, self._cfg(url, url))
+        messages = [{"role": "user", "content": "hi"}]
+        if call == "async_vision":
+            asyncio.run(ac.async_call_llm(task="vision", messages=messages, max_tokens=5))
+        elif call == "sync_vision":
+            ac.call_llm(task="vision", messages=messages, max_tokens=5)
+        else:
+            ac.call_llm(provider="custom:proxy", model="m", base_url=url, messages=messages, max_tokens=5)
+        assert seen == ["Bearer vk-proxy-1234"]
+
+    def test_key_not_forwarded_to_a_different_origin(self, tmp_path, stub):
+        """A task base_url on another origin than the entry's must not receive the entry's key."""
+        import asyncio
+        from agent import auxiliary_client as ac
+        url, seen = stub
+        _write_config(tmp_path, self._cfg("http://127.0.0.2:1/v1", url))
+        asyncio.run(ac.async_call_llm(task="vision", messages=[{"role": "user", "content": "hi"}], max_tokens=5))
+        assert seen == ["Bearer no-key-required"]
