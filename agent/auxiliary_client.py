@@ -6106,11 +6106,19 @@ def _unwrap_moa_provider(prov: str, mdl: Optional[str]) -> Tuple[str, Optional[s
     return prov, mdl
 
 
-def _preserve_provider_with_base_url(prov: Optional[str]) -> bool:
+def _preserve_provider_with_base_url(prov: Optional[str], base_url: Optional[str] = None) -> bool:
     """True when a first-class provider keeps its identity alongside an explicit base_url."""
     normalized = str(prov or "").strip().lower()
-    if normalized in {"", "auto", "custom"} or normalized.startswith("custom:"):
+    if normalized in {"", "auto", "custom"}:
         return False
+    if normalized.startswith("custom:"):
+        # The vision chain re-enters with provider+base_url explicit; collapsing to bare ``custom``
+        # drops the entry's key_cmd/key_env and sends ``no-key-required``. Keep the name only when
+        # base_url is the entry's own origin: anywhere else must not receive the entry's key. A name
+        # that is also a built-in (``custom:nous``) still collapses: dispatch and the pool peek
+        # strip ``custom:`` and would hand it the built-in's credentials.
+        return (not _builtin_provider_present(normalized.split(":", 1)[1].strip())
+                and _named_custom_provider_present(normalized, same_origin_as=base_url or ""))
     if normalized in _LOCAL_SERVER_ALIASES:
         return True  # the custom branch applies the /v1 tail only when it still sees the alias
     # #76602 — two independent lookups, each guarded by its own try/except so a partial
@@ -6126,13 +6134,8 @@ def _preserve_provider_with_base_url(prov: Optional[str]) -> bool:
 
 
 def _builtin_provider_present(name: str) -> bool:
-    """Look up *name* in the built-in provider registry, returning False
-    (not raising) when the catalog fails to load.
-
-    Used by ``_preserve_provider_with_base_url`` so a built-in lookup
-    exception cannot suppress the parallel user-defined provider lookup
-    (#76602).
-    """
+    """*name* is in the built-in provider registry; never raises, so a catalog-load failure cannot
+    suppress the parallel user-defined lookup in ``_preserve_provider_with_base_url`` (#76602)."""
     try:
         from hermes_cli.providers import get_provider
 
@@ -6140,35 +6143,26 @@ def _builtin_provider_present(name: str) -> bool:
     except Exception:
         # Keep the high-risk provider-backed routes safe even if provider
         # catalog loading is unavailable during early import/test paths.
-        return name in {
-            "anthropic",
-            "copilot",
-            "copilot-acp",
-            "minimax-oauth",
-            "nous",
-            "openai-codex",
-            "qwen-oauth",
-            "xai-oauth",
-        }
+        return name in {"anthropic", "copilot", "copilot-acp", "minimax-oauth", "nous",
+                        "openai-codex", "qwen-oauth", "xai-oauth"}
 
 
-def _named_custom_provider_present(name: str) -> bool:
-    """Look up *name* in the user-defined ``providers:`` section of
-    config.yaml, returning False when the config is unavailable or
-    fails to load.
-
-    Used by ``_preserve_provider_with_base_url`` so a user-defined
-    provider remains preserved even when the built-in registry raises
-    (parallel lookup; each side fails independently — #76602).
-    """
+def _named_custom_provider_present(name: str, same_origin_as: Optional[str] = None) -> bool:
+    """*name* is a user-defined ``providers:`` / ``custom_providers:`` entry (and, when
+    *same_origin_as* is given, its base_url has that URL's origin). Never raises, so it stays
+    independent of the built-in lookup in ``_preserve_provider_with_base_url`` (#76602)."""
     try:
         from hermes_cli.runtime_provider import _get_named_custom_provider
 
-        return _get_named_custom_provider(name) is not None
+        entry = _get_named_custom_provider(name)
     except Exception:
         # Config not loaded yet (early import paths, tests) — fail closed:
         # never widen True just because the import / load failed.
         return False
+    if entry is None or same_origin_as is None:
+        return entry is not None
+    origin = base_url_origin(same_origin_as)
+    return bool(origin[1]) and base_url_origin(str(entry.get("base_url") or "")) == origin
 
 
 def _resolve_task_provider_model(
@@ -6232,7 +6226,7 @@ def _resolve_task_provider_model(
         if not api_key:
             api_key = cfg_api_key
     if base_url:
-        kept = provider if _preserve_provider_with_base_url(provider) else "custom"
+        kept = provider if _preserve_provider_with_base_url(provider, base_url) else "custom"
         return kept, resolved_model, base_url, api_key, resolved_api_mode
     if provider:
         return provider, resolved_model, base_url, api_key, resolved_api_mode
