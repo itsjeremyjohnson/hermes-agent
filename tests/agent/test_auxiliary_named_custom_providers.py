@@ -695,3 +695,12 @@ class TestCustomPrefixedNamedProviderWithBaseUrl:
         _write_config(tmp_path, self._cfg("http://127.0.0.2:1/v1", url))
         asyncio.run(ac.async_call_llm(task="vision", messages=[{"role": "user", "content": "hi"}], max_tokens=5))
         assert seen == ["Bearer no-key-required"]
+
+    def test_malformed_entry_url_keeps_the_explicit_route(self, tmp_path, stub):
+        """A saved entry URL that does not parse must not break an explicit, valid call."""
+        from agent import auxiliary_client as ac
+        url, seen = stub
+        _write_config(tmp_path, self._cfg("http://[bad", url))
+        ac.call_llm(provider="custom:proxy", model="m", base_url=url, api_key="sk-explicit",
+                    messages=[{"role": "user", "content": "hi"}], max_tokens=5)
+        assert seen == ["Bearer sk-explicit"]

@@ -6161,8 +6161,13 @@ def _named_custom_provider_present(name: str, same_origin_as: Optional[str] = No
         return False
     if entry is None or same_origin_as is None:
         return entry is not None
-    origin = base_url_origin(same_origin_as)
-    return bool(origin[1]) and base_url_origin(str(entry.get("base_url") or "")) == origin
+    try:
+        origin = base_url_origin(same_origin_as)
+        return bool(origin[1]) and base_url_origin(str(entry.get("base_url") or "")) == origin
+    except ValueError:
+        # A malformed URL (e.g. "http://[bad") is no match; the caller keeps its
+        # explicit route instead of crashing.
+        return False
 
 
 def _resolve_task_provider_model(
