@@ -26,6 +26,9 @@ safe boundary. `tools/bot_mode_dm_reply.py` is the pattern: next-turn admission 
 A parked payload names its owner's profile home, and any delivery outside that profile's turn binds
 its scope: per-user temp dirs are shared by every profile, so a maintenance sweep only removes.
 Admission drains never wait: filter by conversation before locking and use a non-blocking lock.
+Binding a scope does not carry vault values: `agent/redact.py` holds them in the registering
+process's memory only. A row published by another process for that profile records
+`has_registered_vault_values` from the owner and withholds raw tool output when it is set.
 
 ## Agent loop (`agent/conversation_loop.py` + `agent/turn_*.py`)
 
