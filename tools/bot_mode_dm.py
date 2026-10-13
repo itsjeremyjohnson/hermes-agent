@@ -343,10 +343,13 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
         return None
 
 
-def _dm_dir() -> Path:
+def _dm_dir(*, create: bool = True) -> Optional[Path]:
+    """The per-user DM directory; ``create=False`` returns None when it does not exist yet."""
     uid_getter = getattr(os, "getuid", None)
     uid = uid_getter() if callable(uid_getter) else None
     path = Path(tempfile.gettempdir()) / (f"{_DM_DIR_NAME}-{uid}" if uid is not None else _DM_DIR_NAME)
+    if not create and not os.path.lexists(path):
+        return None
     path.mkdir(mode=0o700, exist_ok=True)
     # Shared POSIX temp roots need a per-user directory. Fail closed if an
     # attacker pre-created the expected path or replaced it with a symlink.
@@ -374,13 +377,15 @@ def cleanup_bot_dm_cache(max_age_hours: float = _DM_STALE_SECONDS / 3600, *, now
         # their runner on purpose — a retry replays the same delivery id from them — so the
         # orphans of runners that never settled are swept here too.
         locations.append((dm_dir, "*.live.json"))
-        # Reply records of runners whose sender and runner both died before settling.
-        from tools.bot_mode_dm_reply import RECORD_SUFFIX
-
-        locations += [(dm_dir, f"*{RECORD_SUFFIX}"), (dm_dir, f"*{RECORD_SUFFIX}.lock")]
     from tools.bot_relay import unlink_files_older_than
 
-    return sum(unlink_files_older_than(d, pattern, cutoff) for d, pattern in locations)
+    removed = sum(unlink_files_older_than(d, pattern, cutoff) for d, pattern in locations)
+    with contextlib.suppress(OSError):
+        # Reply records: pending outcomes get a delivery attempt instead of an age-based delete.
+        from tools.bot_mode_dm_reply import sweep
+
+        removed += sweep(_dm_dir(), cutoff)
+    return removed
 
 
 def _unlink_dm_file(path: str) -> None:

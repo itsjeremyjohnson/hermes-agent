@@ -7,19 +7,22 @@ reply. A one-shot sender (``hermes chat -Q``: the cron Bot Chat lane) lingers at
 no consumer: no notification, no result file, no transcript row (charlie-hermes#43). The
 runner survives its sender (``start_new_session``); only the pipe that carried its reply dies.
 
-One private record per runner, advanced under a per-record lock by exactly two parties:
+One private record per runner, advanced under a per-record lock:
 
 - the runner on exit (:func:`run_and_settle`): ``armed`` -> ``finished`` with its outcome, or,
-  when the sender already handed off, ``handoff`` -> it appends the outcome itself;
+  when the sender already handed off, ``handoff`` -> ``pending`` with its outcome;
 - the sender (:func:`settle`, from interpreter exit or the notify-less poll thread): delivered
   in-process (a consumer drained the completion, or the model read it) -> discard; runner
-  gone but undelivered -> it appends the outcome; runner still running at exit -> ``handoff``.
+  gone but undelivered -> ``pending``; runner still running at exit -> ``handoff``.
 
 The sender hands off only from interpreter exit, after its last consumer stopped, so the
-notification and the transcript row never both happen. The row is the DELIVERY row a
-notify-less sender already persisted (``display_kind="process_complete"``), appended between
-turns: the runner waits while any live surface holds the sender's Bot Chat, and the next
-turn loads it as ordinary history (no past context rewritten, nothing injected mid-loop).
+notification and the transcript row never both happen. A ``pending`` record holds the outcome
+until it lands as the DELIVERY row a notify-less sender already persisted
+(``display_kind="process_complete"``), and only at a turn boundary: either a party holding the
+outcome takes the conversation's turn lease itself while no live surface holds the session
+(:func:`deliver`), or the conversation's next turn appends it under its own lease at admission
+(:func:`deliver_pending`) and starts from the reloaded transcript. A refused delivery keeps the
+record; no surface's lifetime discards it.
 """
 
 from __future__ import annotations
@@ -40,10 +43,14 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 RECORD_SUFFIX = ".reply.json"
-# A live surface (the next one-shot, a Desktop tab) holding the sender's Bot Chat defers the
-# runner's append until the turn boundary; past this budget the record is left as evidence.
-_OWNER_WAIT_SECONDS = 60 * 60
-_OWNER_POLL_SECONDS = 1.0
+# How long a party holding an outcome keeps retrying a refused delivery (a running turn, or a live
+# surface holding the session). Past it the record stays ``pending`` for the next turn's admission.
+_DELIVERY_RETRY_SECONDS = 60 * 60
+_DELIVERY_POLL_SECONDS = 1.0
+_DELIVERY_LEASE_TTL_SECONDS = 60.0
+# A ``pending`` record nobody could deliver for this long (state.db gone, conversation never resumed
+# while a surface stays held) is dropped by the DM sweeper.
+PENDING_MAX_AGE_SECONDS = 7 * 24 * 3600
 
 _armed: dict[str, Any] = {}  # record path -> ProcessSession, for runners this process spawned
 _armed_lock = threading.Lock()
@@ -106,33 +113,38 @@ def settle_when_done(path: str, proc: Any) -> None:
     def _run() -> None:
         proc._completion_event.wait()
         try:
-            settle(path, proc, exiting=False)
+            if settle(path, proc, exiting=False):
+                _deliver_until(path, _DELIVERY_RETRY_SECONDS)
         except Exception as exc:
             logger.warning("message_agent: could not settle the reply of %s: %s", proc.id, exc)
 
     threading.Thread(target=_run, name=f"message-agent-reply-{proc.id}", daemon=True).start()
 
 
-def settle(path: str, proc: Any, *, exiting: bool) -> None:
-    """Sender side. ``exiting``: no consumer of this process will run again."""
+def settle(path: str, proc: Any, *, exiting: bool) -> bool:
+    """Sender side. ``exiting``: no consumer of this process will run again. Returns whether the
+    record is now ``pending`` (the caller owns a delivery attempt)."""
     with _locked(path):
         record = _read(path)
         if record is None or record["state"] not in ("armed", "finished"):
-            return
+            return False
         if _delivered_in_process(proc):
             _discard(path)
-            return
+            _forget(path)
+            return False
         if record["state"] == "armed":
             if not proc._completion_event.is_set():
                 if exiting:
                     record["state"] = "handoff"
                     _write(path, record)
-                return
+                return False
             # The runner exited without recording (killed, or done before arm): the registry has it.
             record.update(exit_code=proc.exit_code, completion_reason=proc.completion_reason,
                           output=proc.output_buffer)
-        _append_row(record)
-        _discard(path)
+        record["state"] = "pending"
+        _write(path, record)
+    _forget(path)
+    return True
 
 
 def run_and_settle(path: str, argv: list[str]) -> int:
@@ -143,7 +155,8 @@ def run_and_settle(path: str, argv: list[str]) -> int:
                           stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
     output = proc.stdout or ""
     try:
-        _finish(path, proc.returncode, output)
+        if _finish(path, proc.returncode, output):
+            _deliver_until(path, _DELIVERY_RETRY_SECONDS)
     except Exception as exc:
         logger.warning("message_agent runner could not settle %s: %s", path, exc)
     try:
@@ -155,34 +168,147 @@ def run_and_settle(path: str, argv: list[str]) -> int:
     return proc.returncode
 
 
-def _finish(path: str, exit_code: int, output: str) -> None:
+def _finish(path: str, exit_code: int, output: str) -> bool:
+    """Record the outcome before anything can wait; returns whether it is now ``pending``."""
     with _locked(path):
         record = _read(path)
-        if record is None:
-            return
-        if record["state"] == "armed":
-            record.update(state="finished", exit_code=exit_code, output=output)
-            _write(path, record)
-            return
-        if record["state"] != "handoff":
-            return
-        record.update(exit_code=exit_code, output=output)
-        if not _wait_for_turn_boundary(Path(record["db_path"]).parent):
-            logger.warning("message_agent reply %s kept: the sender's Bot Chat stayed busy", path)
-            return
-        _append_row(record)
-        _discard(path)
-
-
-def _wait_for_turn_boundary(home: Path) -> bool:
-    from tools.bot_live_delivery import find_canonical_owner
-
-    deadline = time.monotonic() + _OWNER_WAIT_SECONDS
-    while find_canonical_owner(home) is not None:
-        if time.monotonic() >= deadline:
+        if record is None or record["state"] not in ("armed", "handoff"):
             return False
-        time.sleep(_OWNER_POLL_SECONDS)
+        pending = record["state"] == "handoff"
+        record.update(state="pending" if pending else "finished", exit_code=exit_code, output=output)
+        _write(path, record)
+        return pending
+
+
+def _deliver_until(path: str, budget: float) -> None:
+    deadline = time.monotonic() + budget
+    while not deliver(path):
+        if time.monotonic() >= deadline:
+            logger.info("message_agent reply %s stays pending for the conversation's next turn", path)
+            return
+        time.sleep(_DELIVERY_POLL_SECONDS)
+
+
+def deliver(path: str) -> bool:
+    """Append a ``pending`` outcome at a turn boundary taken here: this party holds the
+    conversation's turn lease (no turn is running, and a turn starting now waits and then reloads
+    the transcript) and no live surface holds the session (its next turn would start from the
+    history it already has; :func:`deliver_pending` hands the row to that turn instead). Returns
+    whether the record is settled; False keeps it for a retry."""
+    from hermes_state_registry import acquire, release_or_close
+
+    with _locked(path):
+        record = _read(path)
+        if record is None or record["state"] != "pending":
+            return True
+        if not Path(record["db_path"]).is_file():
+            return False
+        db = acquire(Path(record["db_path"]))
+        try:
+            session_id = db.resolve_resume_session_id(record["session_id"]) or record["session_id"]
+            holder = f"pid={os.getpid()}:message-agent-reply:{uuid.uuid4().hex[:8]}"
+            if not db.try_acquire_session_turn_lease(session_id, holder, ttl_seconds=_DELIVERY_LEASE_TTL_SECONDS,
+                                                     patience_s=0.5):
+                return False
+            try:
+                if _surface_holds(Path(record["db_path"]).parent, db, session_id):
+                    return False
+                _append_row(db, session_id, record, turn_lease_holder=holder)
+            finally:
+                db.release_session_turn_lease(session_id, holder)
+        finally:
+            release_or_close(db)
+        _discard(path)
     return True
+
+
+def deliver_pending(db: Any, session_id: str, turn_lease_holder: str) -> int:
+    """Turn admission, with ``turn_lease_holder`` owning the conversation's lease: append every
+    ``pending`` reply addressed to this conversation before the turn loads history. Returns the
+    number appended; the caller reloads the transcript when it is non-zero."""
+    from tools.bot_mode_dm import _dm_dir
+
+    directory = _dm_dir(create=False)
+    if directory is None or not getattr(db, "db_path", None):
+        return 0
+    db_path = Path(db.db_path).resolve()
+    tip = db.resolve_resume_session_id(session_id) or session_id
+    delivered = 0
+    for record_path in sorted(directory.glob(f"*{RECORD_SUFFIX}")):
+        path = str(record_path)
+        try:
+            peek = _read(path)
+            if not _addressed_to(peek, db_path):
+                continue
+            with _locked(path):
+                record = _read(path)
+                if not _addressed_to(record, db_path) or (
+                        db.resolve_resume_session_id(record["session_id"]) or record["session_id"]) != tip:
+                    continue
+                _append_row(db, tip, record, turn_lease_holder=turn_lease_holder)
+                _discard(path)
+                delivered += 1
+        except Exception as exc:
+            logger.warning("message_agent: could not deliver pending reply %s: %s", path, exc)
+    return delivered
+
+
+def sweep(directory: Path, cutoff: float) -> int:
+    """DM-cache sweep for reply records; returns files removed. ``pending`` outcomes get a delivery
+    attempt and are dropped only past :data:`PENDING_MAX_AGE_SECONDS`; any other record older than
+    ``cutoff`` lost both parties before settling and is removed with its lock."""
+    removed = 0
+    now = time.time()
+    for record_path in directory.glob(f"*{RECORD_SUFFIX}"):
+        path = str(record_path)
+        try:
+            record = _read(path)
+            if record is not None and record.get("state") == "pending":
+                if deliver(path):
+                    removed += 1
+                elif record_path.stat().st_mtime < now - PENDING_MAX_AGE_SECONDS:
+                    logger.warning("message_agent: dropping reply %s, undeliverable for 7 days", path)
+                    with _locked(path):
+                        _discard(path)
+                    removed += 1
+            elif record_path.stat().st_mtime < cutoff:
+                with _locked(path):
+                    _discard(path)
+                removed += 1
+        except Exception as exc:  # the sweep runs inside message_agent's DM write: never fail it
+            logger.debug("message_agent: reply record sweep skipped %s: %s", path, exc)
+    for lock_path in directory.glob(f"*{RECORD_SUFFIX}.lock"):
+        with contextlib.suppress(OSError):
+            if not Path(str(lock_path)[:-len(".lock")]).exists() and lock_path.stat().st_mtime < cutoff:
+                lock_path.unlink()
+                removed += 1
+    return removed
+
+
+def _addressed_to(record: Optional[dict], db_path: Path) -> bool:
+    return bool(record) and record.get("state") == "pending" and Path(record["db_path"]).resolve() == db_path
+
+
+def _surface_holds(home: Path, db: Any, tip: str) -> bool:
+    """Whether a live surface (a one-shot, a Desktop tab) holds this conversation's session.
+    An unreadable registry counts as held (the delivery is retried, never forced)."""
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    try:
+        entries = active_session_registry_snapshot(registry_home=home)
+    except Exception as exc:
+        logger.debug("message_agent: active-session registry unreadable: %s", exc)
+        return True
+    for entry in entries:
+        held = entry.get("session_id")
+        if held and (held == tip or db.resolve_resume_session_id(held) == tip):
+            return True
+    return False
+
+
+def _forget(path: str) -> None:
+    with _armed_lock:
+        _armed.pop(path, None)
 
 
 def _delivered_in_process(proc: Any) -> bool:
@@ -219,15 +345,16 @@ def _settle_all_at_exit() -> None:
         _armed.clear()
     for path, proc in items:
         try:
-            settle(path, proc, exiting=True)
+            # One attempt: exit must not wait. A refused delivery stays pending for the next turn.
+            if settle(path, proc, exiting=True):
+                deliver(path)
         except Exception as exc:
             logger.warning("message_agent: could not hand off the reply of %s: %s", proc.id, exc)
 
 
-def _append_row(record: dict) -> None:
-    """The DELIVERY row a push surface persists for the same completion, on the sender's
-    current compression tip."""
-    from hermes_state_registry import acquire, release_or_close
+def _append_row(db: Any, session_id: str, record: dict, *, turn_lease_holder: str) -> None:
+    """The DELIVERY row a push surface persists for the same completion, written under the
+    conversation's turn lease (the append transaction re-checks ``turn_lease_holder``)."""
     from tools.bot_mode_dm import REPLY_COMPLETION_CHARS
     from tools.process_registry import _redact_process_result
     from tools.process_registry_notifications import (
@@ -241,11 +368,7 @@ def _append_row(record: dict) -> None:
     if len(output) > REPLY_COMPLETION_CHARS:
         evt["output_cut"] = len(output) - REPLY_COMPLETION_CHARS
     _redact_process_result(evt)
-    db = acquire(Path(record["db_path"]))
-    try:
-        session_id = db.resolve_resume_session_id(record["session_id"]) or record["session_id"]
-        db.append_message(session_id, "user", content=format_process_notification(evt),
-                          display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
-                          display_metadata={"display_text": process_completion_display_text([evt])})
-    finally:
-        release_or_close(db)
+    db.append_message(session_id, "user", content=format_process_notification(evt),
+                      display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
+                      display_metadata={"display_text": process_completion_display_text([evt])},
+                      turn_lease_holder=turn_lease_holder)

@@ -287,10 +287,13 @@ def admit_durable_turn_lease(
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
     try:
-        if waited:
-            agent._emit_status("Session is free; loading the latest transcript...")
+        drained = _deliver_pending_replies(db, session_id, holder)
+        if waited or drained:
+            if waited:
+                agent._emit_status("Session is free; loading the latest transcript...")
             # The holder may have compressed/rotated the session while we waited: reload only
-            # AFTER admission; an immediate acquisition skips this (needless prompt-cache miss).
+            # AFTER admission; an immediate acquisition skips this (needless prompt-cache miss)
+            # unless this admission itself appended pending replies.
             latest_session_id = db.resolve_resume_session_id(session_id)
             if latest_session_id:
                 agent.session_id = latest_session_id
@@ -314,6 +317,18 @@ def admit_durable_turn_lease(
         raise
     admission.lease = lease
     return admission
+
+
+def _deliver_pending_replies(db, session_id: str, holder: str) -> int:
+    """Append ``message_agent`` replies that outlived their sender (charlie-hermes#43) under this
+    turn's lease, before the turn reads history. Never blocks the turn."""
+    try:
+        from tools.bot_mode_dm_reply import deliver_pending
+
+        return deliver_pending(db, session_id, holder)
+    except Exception:
+        logger.warning("Could not deliver pending message_agent replies for %s", session_id, exc_info=True)
+        return 0
 
 
 def carry_unadmitted_user_message(
