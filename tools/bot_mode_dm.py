@@ -381,7 +381,7 @@ def cleanup_bot_dm_cache(max_age_hours: float = _DM_STALE_SECONDS / 3600, *, now
 
     removed = sum(unlink_files_older_than(d, pattern, cutoff) for d, pattern in locations)
     with contextlib.suppress(OSError):
-        # Reply records: pending outcomes get a delivery attempt instead of an age-based delete.
+        # Reply records: removal only; pending outcomes keep a longer horizon (see sweep).
         from tools.bot_mode_dm_reply import sweep
 
         removed += sweep(_dm_dir(), cutoff)

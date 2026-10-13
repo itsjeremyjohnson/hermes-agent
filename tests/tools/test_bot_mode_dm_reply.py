@@ -10,6 +10,7 @@ one-shot linger code against a temp ``HERMES_HOME``. The only stand-in is the te
 surfaces hold the real SessionDB turn lease and the real active-session registry slot.
 """
 
+import contextlib
 import json
 import os
 import signal
@@ -168,6 +169,25 @@ def test_reply_waits_out_a_running_turn_and_lands_after_it(tmp_path):
     assert tail[-3:] == [("user", "next request"), ("assistant", "answer"), ("user", REPLY)]
 
 
+def _admit(db, session_id):
+    """A real durable turn admission of ``session_id``; returns the history the turn starts from."""
+    from agent.turn_facade_lease import admit_durable_turn_lease
+
+    agent = SimpleNamespace(_session_db=db, session_id=session_id, _persist_disabled=False,
+                            _interrupt_requested=False, _interrupt_message=None,
+                            _execution_thread_id=None, _session_turn_lease_refresh_interval=60.0)
+    agent._emit_status = agent._emit_warning = agent._touch_activity = lambda *a, **k: None
+    agent._liveness_activity_lock = threading.Lock
+    admission = admit_durable_turn_lease(
+        agent, session_id=session_id, relay_turn_id=f"{session_id}:t:abcd",
+        task_context={"session_id": session_id, "task_id": "t", "platform": "desktop"},
+        conversation_history=[])
+    try:
+        return admission.conversation_history
+    finally:
+        admission.lease.release()
+
+
 def _kill_runners(tmp_path):
     for proc in psutil.process_iter(["cmdline"]):
         cmdline = proc.info["cmdline"] or []
@@ -181,7 +201,6 @@ def _kill_runners(tmp_path):
 @pytest.mark.live_system_guard_bypass
 def test_reply_held_by_an_idle_surface_survives_its_runner_and_reaches_that_surfaces_next_turn(
         tmp_path, monkeypatch):
-    from agent.turn_facade_lease import admit_durable_turn_lease
     from hermes_cli.active_sessions import release_active_session, try_acquire_active_session
     from hermes_state import SessionDB
 
@@ -197,22 +216,177 @@ def test_reply_held_by_an_idle_surface_survives_its_runner_and_reaches_that_surf
         assert _reply_rows(home) == []
         _kill_runners(tmp_path)  # the runner's retry budget is gone; only the record remains
 
-        agent = SimpleNamespace(_session_db=db, session_id="bot-chat", _persist_disabled=False,
-                                _interrupt_requested=False, _interrupt_message=None,
-                                _execution_thread_id=None, _session_turn_lease_refresh_interval=60.0)
-        agent._emit_status = agent._emit_warning = agent._touch_activity = lambda *a, **k: None
-        agent._liveness_activity_lock = threading.Lock
-        admission = admit_durable_turn_lease(
-            agent, session_id="bot-chat", relay_turn_id="bot-chat:t:abcd",
-            task_context={"session_id": "bot-chat", "task_id": "t", "platform": "desktop"},
-            conversation_history=[])
-        try:
-            history = admission.conversation_history
-        finally:
-            admission.lease.release()
+        history = _admit(db, "bot-chat")
     finally:
         db.close()
         release_active_session(surface)
 
     assert [(m["role"], REPLY in str(m["content"])) for m in history] == [("user", True)]
     assert len(_reply_rows(home)) == 1
+
+
+# ---- Reply records driven in-process: the sender's real record calls, no teammate process ----
+
+def _record(db_path, session_id, *, output=None, proc_id="proc_test"):
+    """A record the sender armed in the CURRENT profile scope. With ``output`` the runner finished
+    and the sender settled it undelivered (``pending``); without, the sender exited while the
+    runner was still running (``handoff``)."""
+    from tools.bot_mode_dm import _dm_dir
+    from tools.bot_mode_dm_reply import arm, new_record_path, settle
+    from tools.process_registry import ProcessSession
+
+    proc = ProcessSession(id=proc_id, command="message_agent runner")
+    path = new_record_path(_dm_dir())
+    assert arm(path, proc, db_path=str(db_path), session_id=session_id)
+    if output is not None:
+        proc.output_buffer, proc.exit_code = output, 0
+        proc._completion_event.set()
+    assert settle(path, proc, exiting=output is None) is (output is not None)
+    return path
+
+
+def _profile(home, *, redact):
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(f"security:\n  redact_secrets: {str(redact).lower()}\n", encoding="utf-8")
+    return home
+
+
+@contextlib.contextmanager
+def _in_profile(home):
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home_token = set_hermes_home_override(str(home))
+    secret_token = set_secret_scope(build_profile_secret_scope(home))
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+def test_a_reply_lands_under_its_owners_redaction_whichever_profile_runs_the_delivery(tmp_path, monkeypatch):
+    """The DM directory is shared by every profile of the OS user: profile A's DM-write sweep, and a
+    delivery running in A's scope (a poll thread, a runner, interpreter exit), must not decide how
+    profile B's reply is redacted."""
+    from agent.redact import redact_sensitive_text, register_vault_redaction_value
+    from hermes_state import SessionDB
+    from tools.bot_mode_dm import cleanup_bot_dm_cache
+    from tools.bot_mode_dm_reply import deliver
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    credential, vault = "ghp_Rv7Qk2Lm9Xc4Tz8Wn1Bp6Hs3Jd5Fg0Ya2Ue", "vault-opaque-value-5517"
+    home_a, home_b = _profile(tmp_path / "a", redact=False), _profile(tmp_path / "b", redact=True)
+    db = SessionDB(db_path=home_b / "state.db")
+    try:
+        db.create_session("chat-b", source="cli")
+        with _in_profile(home_b):
+            register_vault_redaction_value(vault)
+            via_runner = _record(db.db_path, "chat-b", output=f"first {credential} {vault}", proc_id="proc_1")
+            _record(db.db_path, "chat-b", output=f"second {credential} {vault}", proc_id="proc_2")
+        with _in_profile(home_a):
+            cleanup_bot_dm_cache()  # A writes a DM: the sweep sees B's pending records
+            assert deliver(via_runner)  # a delivery that runs in A's scope
+        with _in_profile(home_b):
+            history = _admit(db, "chat-b")  # B's next turn takes the other one
+        with _in_profile(home_a):
+            a_still_unredacted = redact_sensitive_text(credential)
+        rows = [m["content"] for m in db.get_messages("chat-b")]
+    finally:
+        db.close()
+
+    assert [(credential in row, vault in row, "ghp_Rv...a2Ue" in row) for row in rows] == [(False, False, True)] * 2
+    seen = "\n".join(m["content"] for m in history)  # consecutive user rows merge on reload
+    assert ("first" in seen, "second" in seen) == (True, True)
+    assert a_still_unredacted == credential
+
+
+def _waits_on_lock(lock_path):
+    """Whether some process is blocked acquiring the flock on ``lock_path`` (Linux /proc/locks)."""
+    inode = f":{os.stat(lock_path).st_ino} "
+    return any("->" in line and inode in line for line in Path("/proc/locks").read_text().splitlines())
+
+
+@pytest.mark.skipif(not Path("/proc/locks").exists(), reason="needs Linux /proc/locks")
+def test_a_runner_outcome_recorded_while_the_sweeper_judges_an_old_handoff_still_reaches_the_conversation(
+        tmp_path, monkeypatch):
+    """A runner can outlive the 24 h DM sweep horizon. Its outcome, recorded while a sweep is
+    deciding whether its old ``handoff`` record is stale, must still reach the next turn."""
+    from hermes_cli.active_sessions import _FileLock
+    from hermes_state import SessionDB
+    from tools.bot_mode_dm import cleanup_bot_dm_cache
+    from tools.bot_mode_dm_reply import _finish
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("chat", source="cli")
+        path = _record(db.db_path, "chat")
+        two_days_ago = time.time() - 2 * 24 * 3600
+        os.utime(path, (two_days_ago, two_days_ago))
+
+        holder = _FileLock(Path(path + ".lock"))  # the runner is mid-update of its record
+        holder.__enter__()
+        try:
+            sweeper = threading.Thread(target=cleanup_bot_dm_cache)
+            sweeper.start()
+            deadline = time.monotonic() + 10
+            while sweeper.is_alive() and not _waits_on_lock(path + ".lock") and time.monotonic() < deadline:
+                time.sleep(0.01)
+            finisher = threading.Thread(target=_finish, args=(path, 0, REPLY))  # the runner's real exit step
+            finisher.start()
+        finally:
+            holder.__exit__(None, None, None)
+        sweeper.join(10)
+        finisher.join(10)
+        cleanup_bot_dm_cache()  # the next housekeeping pass
+
+        history = _admit(db, "chat")
+    finally:
+        db.close()
+
+    assert [REPLY in m["content"] for m in history] == [True]
+
+
+def test_turn_admission_never_waits_on_a_reply_record_another_party_holds(tmp_path, monkeypatch):
+    """A runner holding a record lock (another conversation's, or this one's) must not stall a
+    turn before its supervision starts; a held record stays pending for a later turn."""
+    from hermes_cli.active_sessions import _FileLock
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("chat-n", source="cli")
+        db.create_session("chat-m", source="cli")
+        own = _record(db.db_path, "chat-n", output="reply for n", proc_id="proc_n")
+        other = _record(db.db_path, "chat-m", output="reply for m", proc_id="proc_m")
+
+        admitted, result = threading.Event(), {}
+
+        def admit_n():
+            result["history"] = _admit(db, "chat-n")
+            admitted.set()
+
+        held = [_FileLock(Path(own + ".lock")), _FileLock(Path(other + ".lock"))]
+        for lock in held:
+            lock.__enter__()
+        try:
+            threading.Thread(target=admit_n, daemon=True).start()
+            admitted_while_held = admitted.wait(10)
+        finally:
+            for lock in held:
+                lock.__exit__(None, None, None)
+        admitted.wait(30)
+
+        later_n, later_m = _admit(db, "chat-n"), _admit(db, "chat-m")
+    finally:
+        db.close()
+
+    assert admitted_while_held
+    assert result["history"] == []
+    assert [m["content"].count("reply for n") > 0 for m in later_n] == [True]
+    assert [m["content"].count("reply for m") > 0 for m in later_m] == [True]

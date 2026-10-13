@@ -23,6 +23,11 @@ outcome takes the conversation's turn lease itself while no live surface holds t
 (:func:`deliver`), or the conversation's next turn appends it under its own lease at admission
 (:func:`deliver_pending`) and starts from the reloaded transcript. A refused delivery keeps the
 record; no surface's lifetime discards it.
+
+The DM directory is per OS user and shared by every profile, so a record names its owner's
+``HERMES_HOME``. :func:`deliver` binds that profile's scope (redaction policy, vault values,
+secrets) whatever process runs it; admission is already bound to its own conversation's profile.
+The DM sweeper never delivers: it only removes records whose parties are gone.
 """
 
 from __future__ import annotations
@@ -48,9 +53,10 @@ RECORD_SUFFIX = ".reply.json"
 _DELIVERY_RETRY_SECONDS = 60 * 60
 _DELIVERY_POLL_SECONDS = 1.0
 _DELIVERY_LEASE_TTL_SECONDS = 60.0
-# A ``pending`` record nobody could deliver for this long (state.db gone, conversation never resumed
-# while a surface stays held) is dropped by the DM sweeper.
+# A ``pending`` record nobody could deliver for this long (state.db gone, conversation never resumed)
+# is dropped by the DM sweeper. ``handoff`` gets the same horizon: its runner may still be running.
 PENDING_MAX_AGE_SECONDS = 7 * 24 * 3600
+_LONG_LIVED_STATES = ("handoff", "pending")
 
 _armed: dict[str, Any] = {}  # record path -> ProcessSession, for runners this process spawned
 _armed_lock = threading.Lock()
@@ -67,6 +73,48 @@ def _locked(path: str):
 
     with _FileLock(Path(path + ".lock")):
         yield
+
+
+@contextlib.contextmanager
+def _try_locked(path: str):
+    """Non-blocking :func:`_locked`: yields False, holding nothing, when another party holds the
+    record. For callers that must never wait on a record (turn admission, the DM sweeper)."""
+    with open(path + ".lock", "a+b") as fh:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True  # closing the file releases the lock
+
+
+@contextlib.contextmanager
+def _owner_scope(hermes_home: str):
+    """Bind the record owner's profile (home + secret + terminal scope) for a delivery that runs
+    outside that profile's turn: a runner, a poll thread, interpreter exit. Same binding as the
+    kanban dispatcher's ``_worker_profile_scope``."""
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_constants import get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    from tools.terminal_scope import install_profile_terminal_scope, reset_terminal_scope
+    from tui_gateway.launch_profile_policy import launch_secret_scope, launch_terminal_env
+
+    home = Path(hermes_home)
+    is_launch_home = home.resolve() == Path(get_process_hermes_home()).resolve()
+    home_token = set_hermes_home_override(str(home))
+    secret_token = set_secret_scope(launch_secret_scope(home) if is_launch_home else build_profile_secret_scope(home))
+    terminal_token = install_profile_terminal_scope(home, env_overlay=launch_terminal_env() if is_launch_home else None)
+    try:
+        yield
+    finally:
+        reset_terminal_scope(terminal_token)
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
 
 
 def _read(path: str) -> Optional[dict]:
@@ -94,11 +142,13 @@ def arm(path: str, proc: Any, *, db_path: str, session_id: str) -> bool:
     re-arms it after a restart, so a runner-side row would duplicate it."""
     if proc is None or proc.watcher_interval > 0 or not db_path or not session_id:
         return False
+    from hermes_constants import get_hermes_home
+
     global _atexit_registered
     _reap_delivered()
     with _locked(path):
         _write(path, {"state": "armed", "proc_id": proc.id, "command": proc.command,
-                      "db_path": str(db_path), "session_id": session_id})
+                      "db_path": str(db_path), "session_id": session_id, "hermes_home": str(get_hermes_home())})
     with _armed_lock:
         _armed[path] = proc
         if not _atexit_registered:
@@ -193,39 +243,48 @@ def deliver(path: str) -> bool:
     """Append a ``pending`` outcome at a turn boundary taken here: this party holds the
     conversation's turn lease (no turn is running, and a turn starting now waits and then reloads
     the transcript) and no live surface holds the session (its next turn would start from the
-    history it already has; :func:`deliver_pending` hands the row to that turn instead). Returns
-    whether the record is settled; False keeps it for a retry."""
-    from hermes_state_registry import acquire, release_or_close
-
+    history it already has; :func:`deliver_pending` hands the row to that turn instead). Runs in
+    the record owner's profile scope, never the caller's. Returns whether the record is settled;
+    False keeps it for a retry."""
     with _locked(path):
         record = _read(path)
         if record is None or record["state"] != "pending":
             return True
-        if not Path(record["db_path"]).is_file():
+        if not record.get("hermes_home") or not Path(record["db_path"]).is_file():
             return False
-        db = acquire(Path(record["db_path"]))
+        with _owner_scope(record["hermes_home"]):
+            delivered = _deliver_locked(record)
+        if delivered:
+            _discard(path)
+        return delivered
+
+
+def _deliver_locked(record: dict) -> bool:
+    from hermes_state_registry import acquire, release_or_close
+
+    db = acquire(Path(record["db_path"]))
+    try:
+        session_id = db.resolve_resume_session_id(record["session_id"]) or record["session_id"]
+        holder = f"pid={os.getpid()}:message-agent-reply:{uuid.uuid4().hex[:8]}"
+        if not db.try_acquire_session_turn_lease(session_id, holder, ttl_seconds=_DELIVERY_LEASE_TTL_SECONDS,
+                                                 patience_s=0.5):
+            return False
         try:
-            session_id = db.resolve_resume_session_id(record["session_id"]) or record["session_id"]
-            holder = f"pid={os.getpid()}:message-agent-reply:{uuid.uuid4().hex[:8]}"
-            if not db.try_acquire_session_turn_lease(session_id, holder, ttl_seconds=_DELIVERY_LEASE_TTL_SECONDS,
-                                                     patience_s=0.5):
+            if _surface_holds(Path(record["db_path"]).parent, db, session_id):
                 return False
-            try:
-                if _surface_holds(Path(record["db_path"]).parent, db, session_id):
-                    return False
-                _append_row(db, session_id, record, turn_lease_holder=holder)
-            finally:
-                db.release_session_turn_lease(session_id, holder)
+            _append_row(db, session_id, record, turn_lease_holder=holder)
         finally:
-            release_or_close(db)
-        _discard(path)
+            db.release_session_turn_lease(session_id, holder)
+    finally:
+        release_or_close(db)
     return True
 
 
 def deliver_pending(db: Any, session_id: str, turn_lease_holder: str) -> int:
     """Turn admission, with ``turn_lease_holder`` owning the conversation's lease: append every
     ``pending`` reply addressed to this conversation before the turn loads history. Returns the
-    number appended; the caller reloads the transcript when it is non-zero."""
+    number appended; the caller reloads the transcript when it is non-zero. Never waits: a record
+    another party holds stays ``pending`` for its holder or the next turn."""
     from tools.bot_mode_dm import _dm_dir
 
     directory = _dm_dir(create=False)
@@ -237,13 +296,10 @@ def deliver_pending(db: Any, session_id: str, turn_lease_holder: str) -> int:
     for record_path in sorted(directory.glob(f"*{RECORD_SUFFIX}")):
         path = str(record_path)
         try:
-            peek = _read(path)
-            if not _addressed_to(peek, db_path):
+            if not _addressed_to(_read(path), db, db_path, tip):
                 continue
-            with _locked(path):
-                record = _read(path)
-                if not _addressed_to(record, db_path) or (
-                        db.resolve_resume_session_id(record["session_id"]) or record["session_id"]) != tip:
+            with _try_locked(path) as locked:
+                if not locked or not _addressed_to(record := _read(path), db, db_path, tip):
                     continue
                 _append_row(db, tip, record, turn_lease_holder=turn_lease_holder)
                 _discard(path)
@@ -254,27 +310,25 @@ def deliver_pending(db: Any, session_id: str, turn_lease_holder: str) -> int:
 
 
 def sweep(directory: Path, cutoff: float) -> int:
-    """DM-cache sweep for reply records; returns files removed. ``pending`` outcomes get a delivery
-    attempt and are dropped only past :data:`PENDING_MAX_AGE_SECONDS`; any other record older than
-    ``cutoff`` lost both parties before settling and is removed with its lock."""
+    """DM-cache sweep for reply records; returns files removed. Never delivers: the sweep runs in
+    whatever profile writes a DM or runs housekeeping, not the record owner's. ``handoff`` and
+    ``pending`` records are removed only past :data:`PENDING_MAX_AGE_SECONDS`; any other record
+    older than ``cutoff`` lost both parties before settling. State and age are judged under the
+    record lock, so a party advancing the record meanwhile keeps it; a held record is skipped."""
     removed = 0
-    now = time.time()
     for record_path in directory.glob(f"*{RECORD_SUFFIX}"):
         path = str(record_path)
         try:
-            record = _read(path)
-            if record is not None and record.get("state") == "pending":
-                if deliver(path):
-                    removed += 1
-                elif record_path.stat().st_mtime < now - PENDING_MAX_AGE_SECONDS:
-                    logger.warning("message_agent: dropping reply %s, undeliverable for 7 days", path)
-                    with _locked(path):
-                        _discard(path)
-                    removed += 1
-            elif record_path.stat().st_mtime < cutoff:
-                with _locked(path):
-                    _discard(path)
-                removed += 1
+            with _try_locked(path) as locked:
+                if not locked or (record := _read(path)) is None:
+                    continue
+                long_lived = record.get("state") in _LONG_LIVED_STATES
+                if record_path.stat().st_mtime >= (time.time() - PENDING_MAX_AGE_SECONDS if long_lived else cutoff):
+                    continue
+                if record.get("state") == "pending":
+                    logger.warning("message_agent: dropping reply %s, undelivered for 7 days", path)
+                _discard(path)
+            removed += 1
         except Exception as exc:  # the sweep runs inside message_agent's DM write: never fail it
             logger.debug("message_agent: reply record sweep skipped %s: %s", path, exc)
     for lock_path in directory.glob(f"*{RECORD_SUFFIX}.lock"):
@@ -285,8 +339,10 @@ def sweep(directory: Path, cutoff: float) -> int:
     return removed
 
 
-def _addressed_to(record: Optional[dict], db_path: Path) -> bool:
-    return bool(record) and record.get("state") == "pending" and Path(record["db_path"]).resolve() == db_path
+def _addressed_to(record: Optional[dict], db: Any, db_path: Path, tip: str) -> bool:
+    """Whether ``record`` is a ``pending`` reply for this database's conversation ``tip``."""
+    return (bool(record) and record.get("state") == "pending" and Path(record["db_path"]).resolve() == db_path
+            and (db.resolve_resume_session_id(record["session_id"]) or record["session_id"]) == tip)
 
 
 def _surface_holds(home: Path, db: Any, tip: str) -> bool:
