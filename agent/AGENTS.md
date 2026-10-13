@@ -23,6 +23,9 @@ turn boundary. A plain `append_message` can land inside a running turn's history
 acquired its lease without waiting never reloads. Hold the conversation's turn lease and pass
 `turn_lease_holder` (or `reject_active_turn_lease`), keep the payload when refused, and retry at a
 safe boundary. `tools/bot_mode_dm_reply.py` is the pattern: next-turn admission drains its pending rows.
+A parked payload names its owner's profile home, and any delivery outside that profile's turn binds
+its scope: per-user temp dirs are shared by every profile, so a maintenance sweep only removes.
+Admission drains never wait: filter by conversation before locking and use a non-blocking lock.
 
 ## Agent loop (`agent/conversation_loop.py` + `agent/turn_*.py`)
 
