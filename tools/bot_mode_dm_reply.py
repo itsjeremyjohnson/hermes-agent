@@ -72,7 +72,8 @@ _armed: dict[str, Any] = {}  # record path -> ProcessSession, for runners this p
 _armed_lock = threading.Lock()
 _atexit_registered = False
 # record path -> (owner home, ProcessSession) for every record this interpreter armed that may still
-# be on disk, settled or not. Lock order: _issued_lock, then a record lock, then the vault registry.
+# be on disk, settled or not. Lock order: agent.redact's vault lifecycle lock (registration only),
+# then _issued_lock, then a record lock, then the vault registry. Nothing here takes the lifecycle lock.
 _issued: dict[str, tuple[str, Any]] = {}
 _issued_lock = threading.Lock()
 
@@ -525,4 +526,6 @@ def _append_row(db: Any, session_id: str, path: str, record: dict, *, turn_lease
                        record["proc_id"], label, session_id)
 
 
+# Runs before any caller can reach arm(), and waits out a registration already in flight: that value
+# is in the registry before arm reads the flag, and every later registration enters this fence.
 add_vault_registration_fence(_guard_before_registration)

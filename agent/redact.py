@@ -31,6 +31,12 @@ logger = logging.getLogger(__name__)
 _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
 _VAULT_REDACTION_LOCK = threading.Lock()
+# Held by a registration from its read of the fence list through its insert, and by a fence
+# installer, so a fence installed while a registration is in flight waits for it to finish: a value
+# either is registered before the installer returns or enters that fence. Outermost in the lock
+# order (lifecycle, then a fence's own locks, then _VAULT_REDACTION_LOCK); nothing that holds a later
+# lock takes this one.
+_VAULT_LIFECYCLE_LOCK = threading.Lock()
 
 
 def _vault_scope() -> str:
@@ -49,7 +55,7 @@ def register_vault_redaction_value(value) -> None:
         return
     normalized = value.replace("\r", "").replace("\n", "")
     scope = _vault_scope()
-    with contextlib.ExitStack() as fences:
+    with _VAULT_LIFECYCLE_LOCK, contextlib.ExitStack() as fences:
         for fence in list(_VAULT_REGISTRATION_FENCES):
             fences.enter_context(fence(scope))
         with _VAULT_REDACTION_LOCK:
@@ -69,8 +75,10 @@ _VAULT_REGISTRATION_FENCES: list = []
 
 
 def add_vault_registration_fence(fence) -> None:
-    if fence not in _VAULT_REGISTRATION_FENCES:
-        _VAULT_REGISTRATION_FENCES.append(fence)
+    """Install ``fence``; returns once no registration that missed it is still in flight."""
+    with _VAULT_LIFECYCLE_LOCK:
+        if fence not in _VAULT_REGISTRATION_FENCES:
+            _VAULT_REGISTRATION_FENCES.append(fence)
 
 
 def clear_vault_redaction_values() -> None:

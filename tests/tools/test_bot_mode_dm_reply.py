@@ -547,6 +547,77 @@ def test_a_vault_value_registered_after_the_senders_last_flag_read_still_keeps_t
     _assert_discarded(tmp_path, home, value)
 
 
+def test_a_vault_fill_in_flight_when_the_reply_module_first_loads_still_keeps_the_reply_out(tmp_path):
+    """A fill on another thread starts registering before anything imported the reply module, so it
+    read no fence. Dispatch then loads the module and arms a record while that registration is in
+    flight; the fill completes at the exiting sender's final flag read. The sender holds the value
+    before it exits, so the runner must not publish the reply."""
+    value = "opaque-first-import-vault-5813"
+    home, gate, fake_hermes, sender, env = _setup(tmp_path, reply=f"{REPLY} {value}")
+    dispatch = 'ack = json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="status?", agent=agent))\n'
+    assert dispatch in _SENDER
+    sender.write_text(_SENDER.replace(dispatch, textwrap.dedent(f"""
+        import threading, time
+        from agent import redact
+        assert "tools.bot_mode_dm_reply" not in sys.modules
+        paused, resume, registered = threading.Event(), threading.Event(), threading.Event()
+
+        class PauseBeforeInsert:  # the fill stops after reading the fence list, before inserting
+            def __init__(self, lock):
+                self.lock = lock
+            def __enter__(self):
+                if threading.current_thread() is fill:
+                    paused.set()
+                    assert resume.wait(30)
+                return self.lock.__enter__()
+            def __exit__(self, *exc):
+                return self.lock.__exit__(*exc)
+
+        def fill_value():
+            redact.register_vault_redaction_value({value!r})
+            registered.set()
+
+        def resume_fill():
+            resume.set()
+            assert registered.wait(10)
+            assert {value!r} not in redact.redact_sensitive_text({value!r})  # the sender masks it from here on
+            print("sender holds the value", file=sys.stderr, flush=True)  # at exit an assert failure keeps exit 0
+
+        redact._VAULT_REDACTION_LOCK = PauseBeforeInsert(redact._VAULT_REDACTION_LOCK)
+        fill = threading.Thread(target=fill_value, daemon=True)
+        fill.start()
+        assert paused.wait(10)
+        acks = []
+        dispatcher = threading.Thread(target=lambda: acks.append(bot_mode_dm.message_agent_tool(
+            target="researcher", message="status?", agent=agent)), daemon=True)
+        dispatcher.start()
+        dispatcher.join(3)
+        if dispatcher.is_alive():  # loading the reply module waits for the fill
+            resume_fill()
+        else:  # armed with the fill in flight: it completes at the sender's final flag read
+            from tools import bot_mode_dm_reply as reply
+            note_vault = reply._note_vault
+
+            def note_vault_then_fill(record):
+                result = note_vault(record)
+                resume_fill()
+                return result
+
+            reply._note_vault = note_vault_then_fill
+        dispatcher.join(30)
+        ack = json.loads(acks[0])
+    """)), encoding="utf-8")
+
+    run = subprocess.run([sys.executable, str(sender), str(REPO), "exits_before_reply", str(home), str(fake_hermes)],
+                         env=env, capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert "sender holds the value" in run.stderr
+    gate.touch()
+    _wait_for_runner_delivery(tmp_path, home)
+
+    _assert_discarded(tmp_path, home, value)
+
+
 def test_a_failure_while_binding_the_owners_scope_leaves_the_callers_scope_intact(tmp_path, monkeypatch):
     from agent import secret_scope
     from agent.secret_scope import get_secret
