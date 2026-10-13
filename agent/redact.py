@@ -4,6 +4,7 @@ Short tokens (< 18 chars) are fully masked; longer ones keep the first 6 and
 last 4 characters for debuggability.
 """
 
+import contextlib
 import logging
 import os
 import re
@@ -47,14 +48,29 @@ def register_vault_redaction_value(value) -> None:
     if not isinstance(value, str) or not value:
         return
     normalized = value.replace("\r", "").replace("\n", "")
-    with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
-        for v in (value, normalized):
-            if v:
-                bucket.pop(v, None)  # re-registering refreshes recency
-                bucket[v] = None
-        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
-            del bucket[next(iter(bucket))]
+    scope = _vault_scope()
+    with contextlib.ExitStack() as fences:
+        for fence in list(_VAULT_REGISTRATION_FENCES):
+            fences.enter_context(fence(scope))
+        with _VAULT_REDACTION_LOCK:
+            bucket = _VAULT_REDACTION_VALUES.setdefault(scope, {})
+            for v in (value, normalized):
+                if v:
+                    bucket.pop(v, None)  # re-registering refreshes recency
+                    bucket[v] = None
+            while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
+                del bucket[next(iter(bucket))]
+
+
+# Context managers ``fence(hermes_home)`` entered around every registration for that profile. A
+# party that published that profile's output for another process to deliver uses one to guard it
+# before the value exists, so no moment has the value registered and the published output unguarded.
+_VAULT_REGISTRATION_FENCES: list = []
+
+
+def add_vault_registration_fence(fence) -> None:
+    if fence not in _VAULT_REGISTRATION_FENCES:
+        _VAULT_REGISTRATION_FENCES.append(fence)
 
 
 def clear_vault_redaction_values() -> None:

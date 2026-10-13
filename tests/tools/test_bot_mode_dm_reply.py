@@ -43,7 +43,10 @@ _SENDER = textwrap.dedent("""
     mode, home, fake_hermes = sys.argv[2:5]
     if len(sys.argv) > 5:  # a vault fill this turn: only this process can scrub the value
         from agent.redact import register_vault_redaction_value
-        register_vault_redaction_value(sys.argv[5])
+        from hermes_logging import setup_logging
+        setup_logging(hermes_home=Path(home))  # the model-readable logs/ a CLI session writes
+        if sys.argv[5]:
+            register_vault_redaction_value(sys.argv[5])
     bot_relay._hermes_cli = lambda: fake_hermes
     db = SessionDB(db_path=Path(home) / "state.db")
     db.create_session("bot-chat", source="cli")
@@ -412,13 +415,36 @@ def _records(tmp_path):
     return [json.loads(p.read_text(encoding="utf-8")) for p in (tmp_path / "tmp").glob("hermes-dm-*/*.reply.json")]
 
 
+def _files_holding(tmp_path, home, *needles):
+    """Files under the DM temp dir or the profile's logs/ (both readable by a later model's file
+    tools) that hold any of ``needles``."""
+    return sorted(str(f) for root in (tmp_path / "tmp", home / "logs") if root.exists() for f in root.rglob("*")
+                  if f.is_file() and any(n.encode() in f.read_bytes() for n in needles))
+
+
+def _wait_for_runner_delivery(tmp_path, home, timeout=30):
+    """Until the runner appended its row and discarded the record."""
+    deadline = time.monotonic() + timeout
+    while (not _messages(home) or _records(tmp_path)) and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+
+def _assert_discarded(tmp_path, home, secret):
+    """A guarded reply lands as the generic notice and leaves no byte of itself anywhere a later
+    model can read: transcript columns, the DM temp dir, the profile's logs."""
+    assert secret not in _stored(home)
+    assert (_records(tmp_path), _files_holding(tmp_path, home, secret, REPLY)) == ([], [])
+    [row] = _messages(home)
+    assert (REPLY in row["content"], "was discarded" in row["content"]) == (False, True)
+
+
 @pytest.mark.live_system_guard_bypass  # the "admission" case SIGKILLs this test's own reparented runner
 @pytest.mark.parametrize("mode", ["linger_delivers", "runner", "admission"])
 def test_a_reply_never_publishes_the_senders_vault_values_from_another_process(tmp_path, monkeypatch, caplog, mode):
     """Vault values live only in the memory of the sender that registered them. Its own consumer
     masks them (``linger_delivers``); a delivery by the runner or by a later turn's admission runs
-    in another interpreter that cannot, so it must withhold the reply. No transcript column names
-    the record (a later turn could read it unmasked); only the operator's log does."""
+    in another interpreter that cannot, so the reply is discarded: no transcript column, record,
+    temp file or log line keeps a byte of it or names where it was."""
     from hermes_cli.active_sessions import release_active_session, try_acquire_active_session
     from hermes_state import SessionDB
 
@@ -438,15 +464,15 @@ def test_a_reply_never_publishes_the_senders_vault_values_from_another_process(t
         assert refusal is None
     try:
         gate.touch()
-        deadline = time.monotonic() + 30
-        if mode == "runner":  # until the runner appended its row and settled the record
-            while ((not _messages(home) or any(r["state"] != "withheld" for r in _records(tmp_path)))
-                   and time.monotonic() < deadline):
-                time.sleep(0.1)
+        if mode == "runner":
+            _wait_for_runner_delivery(tmp_path, home)
         elif mode == "admission":
+            deadline = time.monotonic() + 30
             while [r["state"] for r in _records(tmp_path)] != ["pending"] and time.monotonic() < deadline:
                 time.sleep(0.1)
             _kill_runners(tmp_path)
+            pending_holds = _files_holding(tmp_path, home, VAULT, REPLY)
+            record_dir = str(next((tmp_path / "tmp").glob("hermes-dm-*")))
             monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
             db = SessionDB(db_path=home / "state.db")
             try:
@@ -463,15 +489,62 @@ def test_a_reply_never_publishes_the_senders_vault_values_from_another_process(t
         assert [("«redacted-vault-secret»" in n, REPLY in n) for n in notifications] == [(True, True)]
         assert (_messages(home), _records(tmp_path)) == ([], [])
         return
-    [record] = _records(tmp_path)
-    [row] = _messages(home)
-    assert (record["state"], VAULT in record["output"]) == ("withheld", True)  # kept on disk for an operator
-    assert (REPLY in row["content"], "withheld" in row["content"]) == (False, True)
-    record_path = next((tmp_path / "tmp").glob("hermes-dm-*/*.reply.json"))
-    stored = _stored(home)
-    assert (str(record_path.parent) in stored, record_path.name.split(".")[0] in stored) == (False, False)
+    _assert_discarded(tmp_path, home, VAULT)
     if mode == "admission":
-        assert str(record_path) in caplog.text
+        assert pending_holds == []  # nor while it waited for the turn
+        assert ("proc_" in caplog.text, record_dir in caplog.text, VAULT in caplog.text) == (True, False, False)
+
+
+@pytest.mark.skipif(not Path("/proc/locks").exists(), reason="needs Linux /proc/locks")
+def test_a_vault_value_registered_after_the_senders_last_flag_read_still_keeps_the_reply_out(tmp_path):
+    """A vault fill on another thread can register right after the exiting sender read the record's
+    flag and before it hands the record off. The sender holds the value before it exits, so the
+    runner must not publish the reply it later receives."""
+    value = "opaque-late-vault-value-2208"
+    home, gate, fake_hermes, sender, env = _setup(tmp_path, reply=f"{REPLY} {value}")
+    sender.write_text(_SENDER + textwrap.dedent(f"""
+        import os, threading, time
+        from agent.redact import redact_sensitive_text
+        from tools import bot_mode_dm_reply as reply
+
+        registered = threading.Event()
+
+        def fill():
+            register_vault_redaction_value({value!r})
+            registered.set()
+
+        def fill_blocked_on_a_record():
+            inodes = [f":{{os.stat(p).st_ino}} " for p in bot_mode_dm._dm_dir().glob("*.reply.json.lock")]
+            return any("->" in line and any(i in line for i in inodes)
+                       for line in Path("/proc/locks").read_text().splitlines())
+
+        note_vault, settle = reply._note_vault, reply.settle
+
+        def note_vault_then_fill(record):  # the exiting sender's final flag read
+            result = note_vault(record)
+            threading.Thread(target=fill, daemon=True).start()
+            deadline = time.monotonic() + 10
+            while not (registered.is_set() or fill_blocked_on_a_record()):
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            return result
+
+        def settle_then_hold_the_value(*args, **kwargs):
+            result = settle(*args, **kwargs)
+            assert registered.wait(10)
+            assert {value!r} not in redact_sensitive_text({value!r})  # the sender masks it from here on
+            return result
+
+        reply._note_vault, reply.settle = note_vault_then_fill, settle_then_hold_the_value
+    """), encoding="utf-8")
+
+    run = subprocess.run([sys.executable, str(sender), str(REPO), "exits_before_reply", str(home), str(fake_hermes),
+                          ""], env=env, capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr
+    gate.touch()
+    _wait_for_runner_delivery(tmp_path, home)
+
+    _assert_discarded(tmp_path, home, value)
 
 
 def test_a_failure_while_binding_the_owners_scope_leaves_the_callers_scope_intact(tmp_path, monkeypatch):

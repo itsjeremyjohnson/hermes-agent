@@ -27,10 +27,12 @@ record; no surface's lifetime discards it.
 The DM directory is per OS user and shared by every profile, so a record names its owner's
 ``HERMES_HOME``. :func:`deliver` binds that profile's scope (redaction policy, secrets) whatever
 process runs it; admission is already bound to its own conversation's profile. Vault values are
-the exception: they live only in the sender's memory, so when the sender held any, a delivery
-from another interpreter (the runner, a later turn's admission) appends a generic notice
-instead of the reply, logs the record path, and the record stays on disk as ``withheld``. The DM sweeper never
-delivers: it only removes records whose parties are gone.
+the exception: they live only in the sender's memory, so a record the sender flagged
+(``vault_guarded``) never holds the reply on disk, and a delivery from another interpreter (the
+runner, a later turn's admission) appends a generic notice that the reply was discarded. The
+sender flags a record when it settles holding any value for the profile, and a later registration
+flags every record this interpreter armed before the value exists (:func:`_guard_before_registration`).
+The DM sweeper never delivers: it only removes records whose parties are gone.
 """
 
 from __future__ import annotations
@@ -48,6 +50,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.redact import add_vault_registration_fence
+
 logger = logging.getLogger(__name__)
 
 RECORD_SUFFIX = ".reply.json"
@@ -59,7 +63,7 @@ _DELIVERY_LEASE_TTL_SECONDS = 60.0
 # A ``pending`` record nobody could deliver for this long (state.db gone, conversation never resumed)
 # is dropped by the DM sweeper. ``handoff`` gets the same horizon: its runner may still be running.
 PENDING_MAX_AGE_SECONDS = 7 * 24 * 3600
-_LONG_LIVED_STATES = ("handoff", "pending", "withheld")
+_LONG_LIVED_STATES = ("handoff", "pending")
 # Identifies this interpreter in the records it arms. Vault values live only in the memory of the
 # process that registered them, so only the sender's own interpreter can scrub them from a reply.
 _INTERPRETER = uuid.uuid4().hex
@@ -67,6 +71,10 @@ _INTERPRETER = uuid.uuid4().hex
 _armed: dict[str, Any] = {}  # record path -> ProcessSession, for runners this process spawned
 _armed_lock = threading.Lock()
 _atexit_registered = False
+# record path -> (owner home, ProcessSession) for every record this interpreter armed that may still
+# be on disk, settled or not. Lock order: _issued_lock, then a record lock, then the vault registry.
+_issued: dict[str, tuple[str, Any]] = {}
+_issued_lock = threading.Lock()
 
 
 def new_record_path(directory: Path) -> str:
@@ -133,6 +141,10 @@ def _read(path: str) -> Optional[dict]:
 def _write(path: str, record: dict) -> None:
     from utils import atomic_json_write
 
+    if record.get("vault_guarded"):
+        # Only the sender could mask the reply, and the record is readable by later models
+        # (file tools, a terminal): never store it.
+        record.pop("output", None)
     atomic_json_write(path, record, mode=0o600)
 
 
@@ -155,8 +167,13 @@ def arm(path: str, proc: Any, *, db_path: str, session_id: str, label: str = "")
     record = {"state": "armed", "proc_id": proc.id, "command": proc.command, "label": label,
               "db_path": str(db_path), "session_id": session_id, "hermes_home": str(get_hermes_home()),
               "armed_by": _INTERPRETER}
-    with _locked(path):
-        _write(path, _note_vault(record))
+    # Issued before the flag is read, both under _issued_lock: a registration either precedes the
+    # read or finds the record to guard.
+    with _issued_lock:
+        _prune_issued()
+        _issued[path] = (record["hermes_home"], proc)
+        with _locked(path):
+            _write(path, _note_vault(record))
     with _armed_lock:
         _armed[path] = proc
         if not _atexit_registered:
@@ -381,19 +398,50 @@ def _note_vault(record: dict) -> dict:
     return record
 
 
-def _withheld(record: dict) -> bool:
-    """Whether the reply may carry the sender's vault values and this interpreter cannot scrub them."""
-    return bool(record.get("vault_guarded")) and record.get("armed_by") != _INTERPRETER
+def _reply_output(path: str, record: dict) -> Optional[str]:
+    """The reply to publish, or None when it was discarded: a guarded record stores none, and only
+    the sender that armed it still holds the reply (its registry's copy) and the values to mask it."""
+    if not record.get("vault_guarded"):
+        return record.get("output") or ""
+    issued = _issued.get(path)
+    if issued is None or record.get("armed_by") != _INTERPRETER:
+        return None
+    proc = issued[1]
+    # A ``finished`` runner wrote its outcome before re-emitting it to this process's registry.
+    return proc.output_buffer if proc._completion_event.wait(2.0) else None
+
+
+@contextlib.contextmanager
+def _guard_before_registration(hermes_home: str):
+    """Vault registration fence (``agent.redact.add_vault_registration_fence``): flag every record
+    this interpreter armed for ``hermes_home`` and still on disk, holding each lock until the value
+    is registered. A settle that read the flag before the value existed wrote under that lock first,
+    so it is flagged here; anything taking the lock later reads the flag or the value. Either way no
+    delivery from another interpreter sees the value registered and the record unflagged."""
+    with _issued_lock:
+        _prune_issued()
+        paths = sorted(path for path, (home, _) in _issued.items() if home == hermes_home)
+        with contextlib.ExitStack() as stack:
+            for path in paths:
+                stack.enter_context(_locked(path))
+                record = _read(path)
+                if record is None:
+                    _discard(path)  # delivered meanwhile; drop the lock file the lock recreated
+                elif not record.get("vault_guarded"):
+                    record["vault_guarded"] = True
+                    _write(path, record)
+            yield
+
+
+def _prune_issued() -> None:
+    """Under _issued_lock: forget records already delivered or discarded."""
+    for path in [path for path in _issued if not os.path.exists(path)]:
+        del _issued[path]
 
 
 def _delivered(path: str, record: dict) -> None:
-    """Called under the record lock once its row is appended. A withheld reply's record stays on
-    disk (``withheld``, never delivered again) for an operator until the 7-day sweep."""
-    if _withheld(record):
-        record["state"] = "withheld"
-        _write(path, record)
-    else:
-        _discard(path)
+    """Called under the record lock once its row is appended."""
+    _discard(path)
 
 
 def _forget(path: str) -> None:
@@ -445,23 +493,22 @@ def _settle_all_at_exit() -> None:
 def _append_row(db: Any, session_id: str, path: str, record: dict, *, turn_lease_holder: str) -> None:
     """The DELIVERY row a push surface persists for the same completion, written under the
     conversation's turn lease (the append transaction re-checks ``turn_lease_holder``). A
-    :func:`_withheld` reply and its command are replaced by a generic notice and the teammate's
-    label. The record path goes only to the log: a later turn that knows it could ``read_file`` the
-    raw reply without the vault values to mask it, and ``display_metadata`` is not model-proof
-    (``hermes sessions export`` emits it)."""
+    discarded reply (see :func:`_reply_output`) and its command are replaced by a generic notice and
+    the teammate's label. No column and no log line names the record: logs and ``display_metadata``
+    (``hermes sessions export``) are model-readable."""
     from tools.bot_mode_dm import REPLY_COMPLETION_CHARS
     from tools.process_registry import _redact_process_result
     from tools.process_registry_notifications import (
         PROCESS_COMPLETE_DISPLAY_KIND, format_process_notification, process_completion_display_text,
     )
 
-    output, command = record.get("output") or "", record["command"]
-    withheld = _withheld(record)
+    output, command = _reply_output(path, record), record["command"]
+    label = record.get("label") or "the teammate"
+    withheld = output is None
     if withheld:  # the command is the ``--reply-record <path>`` wrapper, so it names the record too
-        label = record.get("label") or "the teammate"
-        output = (f"The reply from {label} arrived after the sending session exited. It is withheld from "
-                  "this transcript because that session held vault secrets that only it could redact. "
-                  "Ask the operator for it.")
+        output = (f"The reply from {label} arrived after the sending session exited and was discarded, "
+                  "because that session held vault secrets that only it could redact. "
+                  f"Ask {label} again if you still need it.")
         command = f"message_agent {label}"
     evt = {"type": "completion", "session_id": record["proc_id"], "command": command,
            "exit_code": record.get("exit_code"), "completion_reason": record.get("completion_reason", "exited"),
@@ -474,5 +521,8 @@ def _append_row(db: Any, session_id: str, path: str, record: dict, *, turn_lease
                       display_metadata={"display_text": process_completion_display_text([evt])},
                       turn_lease_holder=turn_lease_holder)
     if withheld:
-        logger.warning("message_agent: withheld the vault-guarded reply of %s in session %s; "
-                       "the raw reply is in %s (kept for 7 days)", record["proc_id"], session_id, path)
+        logger.warning("message_agent: discarded the vault-guarded reply of %s from %s in session %s",
+                       record["proc_id"], label, session_id)
+
+
+add_vault_registration_fence(_guard_before_registration)
