@@ -18,6 +18,12 @@ config/provider later), `max_iterations` (default 500, shared with subagents),
 `chat(message) -> str` is the simple interface; `run_conversation(user_message, system_message=None,
 conversation_history=None, task_id=None) -> dict` returns `final_response` + `messages`.
 
+A transcript row written from outside a turn (a detached completion, a delivery row) must land at a
+turn boundary. A plain `append_message` can land inside a running turn's history, and a turn that
+acquired its lease without waiting never reloads. Hold the conversation's turn lease and pass
+`turn_lease_holder` (or `reject_active_turn_lease`), keep the payload when refused, and retry at a
+safe boundary. `tools/bot_mode_dm_reply.py` is the pattern: next-turn admission drains its pending rows.
+
 ## Agent loop (`agent/conversation_loop.py` + `agent/turn_*.py`)
 
 Entirely synchronous, with interrupt checks, budget tracking, and a one-turn grace call:
