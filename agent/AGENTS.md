@@ -27,11 +27,14 @@ A parked payload names its owner's profile home, and any delivery outside that p
 its scope: per-user temp dirs are shared by every profile, so a maintenance sweep only removes.
 Admission drains never wait: filter by conversation before locking and use a non-blocking lock.
 Binding a scope does not carry vault values: `agent/redact.py` holds them in the registering
-process's memory only. A row published by another process for that profile records
-`has_registered_vault_values` from the owner and withholds raw tool output when it is set.
-The withheld row must not name where the raw output lives, in any column: `display_metadata`
-reaches a model through `hermes sessions export`, and a process `command` can embed file paths.
-Log the location for the operator instead.
+process's memory only. Output that another process will publish for that profile records
+`has_registered_vault_values` from the owner, and once that flag is set the output is discarded:
+neither the parked payload nor the published row keeps it. Anything a later model can read is not
+a safe place for it: `agent.log`/`errors.log` and per-user temp dirs are open to `read_file`, and
+`display_metadata` reaches a model through `hermes sessions export`. The notice and its log line
+carry ids and labels only. A registration after the owner's last flag read must still guard the
+payload: register a fence with `agent.redact.add_vault_registration_fence` that flags the payload
+under its lock before the value exists.
 
 ## Agent loop (`agent/conversation_loop.py` + `agent/turn_*.py`)
 
