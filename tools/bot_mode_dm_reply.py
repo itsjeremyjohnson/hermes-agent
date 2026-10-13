@@ -28,8 +28,8 @@ The DM directory is per OS user and shared by every profile, so a record names i
 ``HERMES_HOME``. :func:`deliver` binds that profile's scope (redaction policy, secrets) whatever
 process runs it; admission is already bound to its own conversation's profile. Vault values are
 the exception: they live only in the sender's memory, so when the sender held any, a delivery
-from another interpreter (the runner, a later turn's admission) appends a notice naming the
-record instead of the reply, and the record stays on disk as ``withheld``. The DM sweeper never
+from another interpreter (the runner, a later turn's admission) appends a generic notice
+instead of the reply, logs the record path, and the record stays on disk as ``withheld``. The DM sweeper never
 delivers: it only removes records whose parties are gone.
 """
 
@@ -445,19 +445,25 @@ def _settle_all_at_exit() -> None:
 def _append_row(db: Any, session_id: str, path: str, record: dict, *, turn_lease_holder: str) -> None:
     """The DELIVERY row a push surface persists for the same completion, written under the
     conversation's turn lease (the append transaction re-checks ``turn_lease_holder``). A
-    :func:`_withheld` reply is replaced by a notice that names its record."""
+    :func:`_withheld` reply and its command are replaced by a generic notice and the teammate's
+    label. The record path goes only to the log: a later turn that knows it could ``read_file`` the
+    raw reply without the vault values to mask it, and ``display_metadata`` is not model-proof
+    (``hermes sessions export`` emits it)."""
     from tools.bot_mode_dm import REPLY_COMPLETION_CHARS
     from tools.process_registry import _redact_process_result
     from tools.process_registry_notifications import (
         PROCESS_COMPLETE_DISPLAY_KIND, format_process_notification, process_completion_display_text,
     )
 
-    output = record.get("output") or ""
-    if _withheld(record):
-        output = (f"The reply from {record.get('label') or 'the teammate'} arrived after the sending session "
-                  "exited. It is withheld from this transcript because that session held vault secrets that "
-                  f"only it could redact. An operator can read it in {path} (kept for 7 days).")
-    evt = {"type": "completion", "session_id": record["proc_id"], "command": record["command"],
+    output, command = record.get("output") or "", record["command"]
+    withheld = _withheld(record)
+    if withheld:  # the command is the ``--reply-record <path>`` wrapper, so it names the record too
+        label = record.get("label") or "the teammate"
+        output = (f"The reply from {label} arrived after the sending session exited. It is withheld from "
+                  "this transcript because that session held vault secrets that only it could redact. "
+                  "Ask the operator for it.")
+        command = f"message_agent {label}"
+    evt = {"type": "completion", "session_id": record["proc_id"], "command": command,
            "exit_code": record.get("exit_code"), "completion_reason": record.get("completion_reason", "exited"),
            "output": output[-REPLY_COMPLETION_CHARS:]}
     if len(output) > REPLY_COMPLETION_CHARS:
@@ -467,3 +473,6 @@ def _append_row(db: Any, session_id: str, path: str, record: dict, *, turn_lease
                       display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
                       display_metadata={"display_text": process_completion_display_text([evt])},
                       turn_lease_holder=turn_lease_holder)
+    if withheld:
+        logger.warning("message_agent: withheld the vault-guarded reply of %s in session %s; "
+                       "the raw reply is in %s (kept for 7 days)", record["proc_id"], session_id, path)

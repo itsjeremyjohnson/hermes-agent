@@ -12,6 +12,7 @@ surfaces hold the real SessionDB turn lease and the real active-session registry
 
 import contextlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -413,10 +414,11 @@ def _records(tmp_path):
 
 @pytest.mark.live_system_guard_bypass  # the "admission" case SIGKILLs this test's own reparented runner
 @pytest.mark.parametrize("mode", ["linger_delivers", "runner", "admission"])
-def test_a_reply_never_publishes_the_senders_vault_values_from_another_process(tmp_path, monkeypatch, mode):
+def test_a_reply_never_publishes_the_senders_vault_values_from_another_process(tmp_path, monkeypatch, caplog, mode):
     """Vault values live only in the memory of the sender that registered them. Its own consumer
     masks them (``linger_delivers``); a delivery by the runner or by a later turn's admission runs
-    in another interpreter that cannot, so it must withhold the reply and say where it is kept."""
+    in another interpreter that cannot, so it must withhold the reply. No transcript column names
+    the record (a later turn could read it unmasked); only the operator's log does."""
     from hermes_cli.active_sessions import release_active_session, try_acquire_active_session
     from hermes_state import SessionDB
 
@@ -448,7 +450,8 @@ def test_a_reply_never_publishes_the_senders_vault_values_from_another_process(t
             monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
             db = SessionDB(db_path=home / "state.db")
             try:
-                _admit(db, "bot-chat")
+                with caplog.at_level(logging.WARNING, logger="tools.bot_mode_dm_reply"):
+                    _admit(db, "bot-chat")
             finally:
                 db.close()
     finally:
@@ -464,7 +467,11 @@ def test_a_reply_never_publishes_the_senders_vault_values_from_another_process(t
     [row] = _messages(home)
     assert (record["state"], VAULT in record["output"]) == ("withheld", True)  # kept on disk for an operator
     assert (REPLY in row["content"], "withheld" in row["content"]) == (False, True)
-    assert str(next((tmp_path / "tmp").glob("hermes-dm-*/*.reply.json"))) in row["content"]
+    record_path = next((tmp_path / "tmp").glob("hermes-dm-*/*.reply.json"))
+    stored = _stored(home)
+    assert (str(record_path.parent) in stored, record_path.name.split(".")[0] in stored) == (False, False)
+    if mode == "admission":
+        assert str(record_path) in caplog.text
 
 
 def test_a_failure_while_binding_the_owners_scope_leaves_the_callers_scope_intact(tmp_path, monkeypatch):
