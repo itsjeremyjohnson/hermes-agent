@@ -83,6 +83,20 @@ def defer(key: str, job: dict, content: str, profile: str, home: Path, *,
         return record
 
 
+def release_claim(key: str) -> dict:
+    """Return a claimed record to the queue. Only for a child's typed pre-turn
+    ``SESSION_NOT_OWNED`` refusal: the lease claim failed before any turn could start,
+    so the claimed attempt provably never ran. Any other outcome keeps its fence."""
+    root = _root()
+    with _FileLock(root / ".lock"):
+        record = read_pending(key)
+        if record is None or record["status"] != "claimed":
+            raise ValueError(f"deferred Bot Chat receipt {key} is not claimed")
+        record.update(status="queued", error=None)
+        atomic_json_write(root / f"{key}.json", record, fsync_dir=True, mode=0o600)
+        return record
+
+
 def drain(root: Path | None = None) -> None:
     """Serialize drains across processes without holding the producer lock."""
     from hermes_cli.backend_retirement import retirement
@@ -139,9 +153,20 @@ def _drain(root: Path) -> None:
         status = "transferred" if receipt else "ambiguous" if error else "settled"
         if job.get("_notification_all_targets_suppressed"):
             status = "suppressed"
-        record.update(status=status, error=error)
-        # A transferred live-owner receipt remains authoritative, including queued.
-        atomic_json_write(path, record, fsync_dir=True, mode=0o600)
+        with _FileLock(root / ".lock"):
+            # This attempt's disposition applies only while the record is still its claim. Another
+            # writer may have moved it on: release_claim re-queued it, then a later admission of the
+            # same key (a failure-route alias) may have suppressed it. That disposition stands, and
+            # this attempt records no incident delivery.
+            try:
+                current = json.loads(path.read_text(encoding="utf-8"))["status"]
+            except (OSError, ValueError, KeyError, TypeError):
+                current = "claimed"  # unreadable: this attempt's disposition overwrites it, as before
+            if current != "claimed":
+                continue
+            record.update(status=status, error=error)
+            # A transferred live-owner receipt remains authoritative, including queued.
+            atomic_json_write(path, record, fsync_dir=True, mode=0o600)
         if record.get("for_failure") and status != "suppressed":
             # The run finished as "queued", so only this drain learns whether the operator was told.
             try:

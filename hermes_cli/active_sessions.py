@@ -128,10 +128,20 @@ class ActiveSessionRefusal(str):
         return obj
 
 
+_REFUSAL_STDERR_PREFIX = "hermes-refusal-reason: "
+
+
 def format_refusal_stderr(message: str) -> str:
     """Keep the refusal contract across the one-shot CLI subprocess boundary."""
     reason = getattr(message, "reason", "")
-    return f"hermes-refusal-reason: {reason}\n{message}" if reason else str(message)
+    return f"{_REFUSAL_STDERR_PREFIX}{reason}\n{message}" if reason else str(message)
+
+
+def parse_refusal_reason(stderr: str) -> Optional[str]:
+    """The typed reason a one-shot CLI child wrote with ``format_refusal_stderr``, or None.
+    Parse the child's FULL stderr: a persisted diagnostic tail can cut the marker off."""
+    return next((line.removeprefix(_REFUSAL_STDERR_PREFIX).strip() for line in (stderr or "").splitlines()
+                 if line.startswith(_REFUSAL_STDERR_PREFIX)), None)
 
 
 def _is_same_writer(entry: dict[str, Any], metadata: Optional[dict[str, Any]]) -> bool:

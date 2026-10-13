@@ -440,10 +440,10 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
         # user row, so the retried process is told to resume it (RESUME_UNANSWERED_TURN_ENV).
         if retry_action(classify_agent_error(turn_failure_text(proc.stdout, proc.stderr))) != RETRY_NONE:
             proc = _turn(retry_turn_env(env))
+    from hermes_cli.active_sessions import parse_refusal_reason
+
     stderr_text = proc.stderr or ""
-    reason = next((line.removeprefix("hermes-refusal-reason: ").strip()
-                   for line in stderr_text.splitlines()
-                   if line.startswith("hermes-refusal-reason: ")), None)
+    reason = parse_refusal_reason(stderr_text)
     # A code wins over prose, including unknown codes from newer CLIs.
     # Only older CLIs without a marker need the historical wording fallback.
     refused_not_owned = (reason == "SESSION_NOT_OWNED" if reason is not None

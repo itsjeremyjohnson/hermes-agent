@@ -30,6 +30,7 @@ from gateway.platforms._shared import (
 )
 
 from .cards import card_spec_to_cards_v2, format_message as _format_message
+from .thread_context import profile_thread_context_store
 
 
 def _adc_would_borrow_foreign_credentials() -> bool:
@@ -485,6 +486,7 @@ def _normalize_gchat_groups(raw: Any) -> Dict[str, Dict[str, Any]]:
             "allow_from": users,
             "users": users,
             "require_mention": None if mention is None else _truthy_setting(mention),
+            "allow_unmentioned_bot_threads": _truthy_setting(entry.get("allow_unmentioned_bot_threads"), False),
         }
     return normalized
 
@@ -557,6 +559,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
         self._last_inbound_thread: Dict[str, str] = {}
         from hermes_constants import get_hermes_home as _get_hermes_home
         self._thread_count_store = _ThreadCountStore(_get_hermes_home() / "google_chat_thread_counts.json")
+        self._thread_context_store = profile_thread_context_store()
         # Reserve each space/thread slot BEFORE the API call so concurrent
         # _keep_typing calls in one thread wait without blocking other threads.
         self._typing_card_inflight: Dict[Tuple[str, Optional[str]], asyncio.Event] = {}
@@ -703,10 +706,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
         sender_id = sender_name or sender_email
         space_name = space.get("name") or ""
         is_group = self._space_is_group(space)
-        if is_group and self._group_requires_mention(space_name) and not self._message_mentions_bot(msg):
-            logger.debug("[GoogleChat] drop group message (mention required, space=%s)", space_name)
-            return False
         if not self._source_parity_access:
+            if is_group and self._group_requires_mention(space_name) and not self._message_mentions_bot(msg):
+                return False
             return True
         if is_group:
             if not self._is_group_allowed(space_name):
@@ -715,11 +717,23 @@ class GoogleChatAdapter(BasePlatformAdapter):
             if not self._group_sender_matches(space_name, sender_name, sender_email):
                 logger.debug("[GoogleChat] drop group message (sender not allowed, %s)", sender_id)
                 return False
+            if self._group_requires_mention(space_name) and not self._message_mentions_bot(msg):
+                entry = self._group_entry(space_name) or {}
+                if not entry.get("allow_unmentioned_bot_threads") or not self._original_thread_context(space_name, msg):
+                    logger.debug("[GoogleChat] drop group message (mention required, space=%s)", space_name)
+                    return False
             return True
         if not self._dm_sender_matches(sender_name, sender_email):
             logger.debug("[GoogleChat] drop DM (dm_policy=%s, sender=%s)", self._dm_policy, sender_id)
             return False
         return True
+
+    def _original_thread_context(self, space_name: str, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            return self._thread_context_store.get(space_name, (msg.get("thread") or {}).get("name"))
+        except Exception:
+            logger.warning("[GoogleChat] thread context read failed", exc_info=True)
+            return None
 
     def _should_thread_chunk(self, chunk_index: int, thread_id: Optional[str]) -> bool:
         if not thread_id:
@@ -1264,9 +1278,13 @@ class GoogleChatAdapter(BasePlatformAdapter):
             user_id=user_id, user_name=sender.get("displayName") or sender_email or sender_name,
             thread_id=session_thread_id, user_id_alt=user_id_alt, message_id=msg.get("name") or None,
         )
+        original = self._original_thread_context(space_name, msg)
         return MessageEvent(
             text=text, message_type=message_type, source=source, raw_message=msg, message_id=msg.get("name") or None,
             media_urls=media_urls, media_types=media_types,
+            reply_to_message_id=original["message_id"] if original else None,
+            reply_to_text=original["text"] if original else None,
+            reply_to_is_own_message=bool(original),
         )
 
     async def _download_attachment(self, attachment: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
@@ -1358,7 +1376,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 body = _thread_body(chunk, chunk_thread if (idx > 0 or not typing_msg_name) else None)
                 try:
                     if idx == 0 and typing_msg_name:
-                        last_result = await self._patch_message(typing_msg_name, body)
+                        last_result = await self._patch_message(
+                            typing_msg_name, body, root_space=chat_id if not thread_id else None)
                         patched_typing = True
                     else:
                         last_result = await self._create_message(chat_id, body)
@@ -1470,7 +1489,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
             logger.debug("[GoogleChat] delete_message failed", exc_info=True)
         return False
 
-    async def _patch_message(self, message_name: str, body: Dict[str, Any]) -> SendResult:
+    async def _patch_message(self, message_name: str, body: Dict[str, Any], *,
+                             root_space: Optional[str] = None) -> SendResult:
         """Update a message's text (and optionally cards) in-place."""
         update_mask = ",".join(k for k in ("text", "cardsV2") if k in body) or "text"
         patch_body = {k: v for k, v in body.items() if k != "thread"}  # thread is immutable
@@ -1478,7 +1498,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
             lambda: self._chat_api.spaces().messages().patch(name=message_name, updateMask=update_mask, body=patch_body)
             .execute(http=self._new_authed_http())
         )
-        return SendResult(success=True, message_id=resp.get("name", message_name))
+        receipt = self._record_root_context(root_space, body, resp) if root_space else None
+        return SendResult(success=True, message_id=resp.get("name", message_name), raw_response=receipt)
 
     def _chunk_text(self, text: str) -> List[str]:
         chunks: List[str] = []
@@ -1559,7 +1580,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("[GoogleChat] outbound thread-count incr failed", exc_info=True)
 
-    async def _create_message(self, chat_id: str, body: Dict[str, Any]) -> SendResult:
+    async def _create_message(self, chat_id: str, body: Dict[str, Any], *,
+                              record_context: bool = True) -> SendResult:
         """POST spaces/{space}/messages via REST (with retry), returning SendResult."""
         kwargs = _create_kwargs(chat_id, body)
         resp = await self._call_with_retry(
@@ -1567,7 +1589,18 @@ class GoogleChatAdapter(BasePlatformAdapter):
             op_name="messages.create",
         )
         self._track_outbound_thread(chat_id, resp)
-        return SendResult(success=True, message_id=resp.get("name"))
+        receipt = self._record_root_context(chat_id, body, resp) if record_context else None
+        return SendResult(success=True, message_id=resp.get("name"), raw_response=receipt)
+
+    def _record_root_context(self, chat_id: str, body: Dict[str, Any], resp: Dict[str, Any]) -> Dict[str, Any]:
+        receipt = {"thread_id": (resp.get("thread") or {}).get("name")}
+        try:
+            receipt["context_recorded"] = self._thread_context_store.record(chat_id, body, resp)
+        except Exception as exc:
+            # The API accepted the message. Returning failure would invite duplicate sends.
+            receipt.update(context_recorded=False, context_error=str(exc))
+            logger.warning("[GoogleChat] accepted message but thread context persistence failed", exc_info=True)
+        return receipt
 
     async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
         """Post a visible 'Hermes is thinking…' marker (Chat has no typing API); ``send()``
@@ -1591,7 +1624,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
 
         async def _create_and_record() -> None:
             try:
-                result = await self._create_message(chat_id, body)
+                result = await self._create_message(chat_id, body, record_context=False)
                 if result.success and result.message_id:
                     if typing_key not in self._typing_messages:
                         self._typing_messages[typing_key] = result.message_id
@@ -1656,7 +1689,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
             return None
         self._typing_messages.pop(typing_key, None)
         try:
-            result = await self._patch_message(current, {"text": text})
+            result = await self._patch_message(
+                current, {"text": text}, root_space=chat_id if not thread_id else None)
             self._typing_messages[typing_key] = _TYPING_CONSUMED_SENTINEL
             return result
         except HttpError as exc:
@@ -2082,11 +2116,20 @@ async def _standalone_send(
             async with session.post(
                 f"https://chat.googleapis.com/v1/{chat_id}/messages", json=_thread_body(message, thread_id),
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                **({"params": {"messageReplyOption": "REPLY_MESSAGE_OR_FAIL"}} if thread_id else {}),
             ) as resp:
                 if resp.status >= 400:
                     return _standalone_error(f"API returned {resp.status}: {(await resp.text())[:300]}")
                 payload = await resp.json()
-        return {"success": True, "message_id": payload.get("name")}
+        result = {"success": True, "message_id": payload.get("name"),
+                  "thread_id": (payload.get("thread") or {}).get("name")}
+        try:
+            result["context_recorded"] = profile_thread_context_store().record(
+                chat_id, _thread_body(message, thread_id), payload)
+        except Exception as exc:
+            result.update(context_recorded=False, context_error=str(exc))
+            logger.warning("[GoogleChat] accepted standalone message but thread context persistence failed", exc_info=True)
+        return result
     except Exception as e:
         logger.debug("Google Chat standalone send raised", exc_info=True)
         return send_error(f"Google Chat standalone send failed: {e}")

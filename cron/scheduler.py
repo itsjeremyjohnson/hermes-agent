@@ -2907,7 +2907,11 @@ def _compose_run_delivery(
         deliver_content = blocked_config_notice(job.get("name") or job["id"], _pf_text)
     elif success:
         deliver_content = final_response
-        _resolve_incidents_for_recovered_job(job)
+        # A binding can declare this run failed after the exact normal-route
+        # send. Do not clear open incidents before that accounting.
+        from cron import delivery_receipts
+        if delivery_receipts.semantic_execution_error(job, final_response) is None:
+            _resolve_incidents_for_recovered_job(job)
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
@@ -3007,6 +3011,9 @@ class _RunDelivery:
     # True when ``error`` is the agent's own ``[CRON_FAILURE]`` evidence rather than a runtime
     # error string, so composition must not run it through the provider-error heuristics.
     agent_declared: bool = False
+    # Lane actually passed to delivery. Later accounting must not pretend the
+    # notice used the failure route.
+    routed_for_failure: Optional[bool] = None
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
@@ -3102,6 +3109,7 @@ def _save_compose_deliver(
             if not owns_delivery:
                 raise _FireClaimLostDuringSideEffect
             d.delivery_attempted = True
+            d.routed_for_failure = not d.success
             d.delivery_error = _deliver_result(
                 job,
                 deliver_content,
@@ -3109,7 +3117,7 @@ def _save_compose_deliver(
                 loop=loop,
                 # Failure summaries (and drift/blocked-config alerts composed into deliver_content
                 # on the failure path) honor the job's failure_deliver override (NS-788).
-                for_failure=not d.success,
+                for_failure=d.routed_for_failure,
             )
     except Exception as de:
         if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -3186,7 +3194,8 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         should_deliver=d.should_deliver,
         unresolved_origin=d.unresolved_origin,
         # Read the lane the notice was actually routed through (failure_deliver on failure).
-        normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)),
+        normalized_deliver=_normalize_deliver_value(_delivery_lane_value(
+            job, for_failure=d.routed_for_failure if d.routed_for_failure is not None else not d.success)),
         incident_acked=d.incident_acked,
         success=d.success,
     )
@@ -3397,6 +3406,15 @@ def _run_one_job_body(
             # The claim died inside a side-effect fence: the side effect did NOT complete.
             _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
             return True
+
+        # The exact card was already handed to the normal route. A validated
+        # binding declaration now changes execution accounting only.
+        if d.success:
+            from cron import delivery_receipts
+            semantic_error = delivery_receipts.semantic_execution_error(job, final_response)
+            if semantic_error is not None:
+                d.success = False
+                d.error = semantic_error
 
         # Empty final_response is a soft failure so last_status is not "ok".
         if d.success and not final_response.strip():

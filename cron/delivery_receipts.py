@@ -10,12 +10,14 @@ from functools import wraps
 import hashlib
 import json
 import os
+import re
 import sqlite3
 
 from cron import delivery_queue, executions
 from hermes_time import now
 
 MAX_RECEIPTS = 1000
+_EXECUTION_ERROR = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
 _verification = ContextVar("cron_receipt_verification", default=None)
 
 
@@ -150,6 +152,52 @@ def _prune(conn):
             ON CONFLICT(job_id) DO UPDATE SET pruned_count=pruned_count+1""", (row["job_id"],))
         conn.execute("DELETE FROM delivery_receipts WHERE execution_id=?", (row["execution_id"],))
         conn.execute("INSERT OR IGNORE INTO delivery_receipt_tombstones VALUES (?)", (row["execution_id"],))
+
+
+def semantic_execution_error(job, content):
+    """Return a validated execution failure declared by this run's normal-lane binding.
+
+    The declaration is immutable receipt metadata. It is not inferred from the
+    delivered text. Quiet bindings, failure-lane routes, and malformed tokens
+    do not qualify, so a successful or quiet result cannot be relabeled.
+    """
+    if not isinstance(job, dict) or not isinstance(content, str):
+        return None
+    execution_id = job.get("execution_id")
+    if not isinstance(execution_id, str) or not execution_id:
+        return None
+    try:
+        binding = _lookup(execution_id)
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    if not binding or binding.get("outcome") == "not_requested":
+        return None
+    if binding.get("job_id") != job.get("id"):
+        return None
+    try:
+        metadata = json.loads(binding.get("metadata_json") or "")
+    except (TypeError, ValueError):
+        return None
+    if type(metadata) is not dict or metadata.get("quiet") is True:
+        return None
+    declared = metadata.get("execution_error")
+    if type(declared) is not str or _EXECUTION_ERROR.fullmatch(declared) is None:
+        return None
+    try:
+        route, targets = _route(job, False)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not targets or binding.get("route_sha256") != route:
+        return None
+    record = executions.get_execution(execution_id)
+    if (
+        not record
+        or record.get("job_id") != job.get("id")
+        or record.get("started_at") != binding.get("started_at")
+        or binding.get("content_sha256") != digest(content)
+    ):
+        return None
+    return declared
 
 
 def track_delivery(send):

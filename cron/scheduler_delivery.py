@@ -802,6 +802,15 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         f"scheduled job, not the user. Review it, act on anything that needs action, and "
         f"summarize for the chat.]\n\n{content}"
     )
+
+    def _publish_pending(pending: dict, key: str) -> Optional[str]:
+        status = pending["status"]
+        target = f"bot-chat:{profile_label}"
+        job.setdefault("_bot_chat_delivery_receipts", {})[target] = {"status": status, "delivery_id": key}
+        if status == "suppressed":
+            job["_notification_all_targets_suppressed"] = True
+        return None if status in ("settled", "suppressed") else f"{target} {status} (receipt {key}): completion unverified; do not resend"
+
     try:
         source_home = get_hermes_home().resolve()
         from pathlib import Path
@@ -841,13 +850,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
                 pending = defer(key, dict(job), content, profile, home,
                                 for_failure=for_failure, suppressed=suppress_notification)
             if pending is not None:
-                status = pending["status"]
-                target = f"bot-chat:{profile_label}"
-                job.setdefault("_bot_chat_delivery_receipts", {})[target] = {
-                    "status": status, "delivery_id": key}
-                if status == "suppressed":
-                    job["_notification_all_targets_suppressed"] = True
-                return None if status in ("settled", "suppressed") else f"{target} {status} (receipt {key}): completion unverified; do not resend"
+                return _publish_pending(pending, key)
         if receipt is None:
             owner = find_canonical_live_owner(home)
             if owner is not None:
@@ -950,6 +953,18 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         env[TURN_REPORT_FILE_ENV] = report_file
         timeout_s = _get_bot_chat_delivery_timeout()
         result = _run_bot_chat_turn(argv, env, report_file, timeout_s)
+        from hermes_cli.active_sessions import SESSION_NOT_OWNED, parse_refusal_reason
+        if result.returncode != 0 and parse_refusal_reason(result.stderr) == SESSION_NOT_OWNED:
+            # A sibling took the session between the owner probe above and the child's lease
+            # claim. The CLI refuses that claim before credentials or agent init, so no turn
+            # started: queue this payload (a drain re-queues its claim) instead of failing it.
+            from cron.bot_chat_delivery import defer, release_claim
+            logger.info("Job '%s': Bot Chat of profile '%s' was taken before the turn started; queued %s",
+                        job_id, profile_label, key)
+            if deferred is not None:
+                release_claim(key)
+                return f"bot-chat:{profile_label} queued (receipt {key}): completion unverified; do not resend"
+            return _publish_pending(defer(key, dict(job), content, profile, home, for_failure=for_failure), key)
         if result.returncode != 0:
             tail = _format_failure_streams(result)
             logger.warning(

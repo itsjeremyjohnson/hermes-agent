@@ -800,6 +800,17 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
             agent._on_session_title = _notify_title_update
             try:
+                # ACP keeps agents across turns. Adopt saved fallback edits without
+                # rebuilding their conversation or replacing an active cooldown fallback.
+                from hermes_cli.config_effective import load_user_config_effective
+                from hermes_cli.fallback_config import get_fallback_chain
+                from gateway.run_config_loaders import GatewayConfigLoadersMixin
+
+                try:
+                    chain = get_fallback_chain(load_user_config_effective(fail_closed=True))
+                    GatewayConfigLoadersMixin._apply_fallback_chain_to_agent(agent, chain)
+                except Exception:
+                    logger.warning("ACP fallback refresh failed; keeping the last known-good chain", exc_info=True)
                 return agent.run_conversation(
                     user_message=user_content, conversation_history=state.history, task_id=session_id,
                     persist_user_message=user_text or "[Image attachment]",

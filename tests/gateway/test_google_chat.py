@@ -880,12 +880,12 @@ class TestTypingLifecycle:
         event = await adapter._build_message_event(payload["message"], env)
         posts = {}
 
-        async def create(chat_id, body):
+        async def create(chat_id, body, **kwargs):
             name = f"{chat_id}/messages/THINK"
             posts[name] = dict(body)
             return types.SimpleNamespace(success=True, message_id=name)
 
-        async def patch(name, body):
+        async def patch(name, body, **kwargs):
             posts[name].update(body)
             return types.SimpleNamespace(success=True, message_id=name)
 
@@ -904,7 +904,7 @@ class TestTypingLifecycle:
     async def test_concurrent_threads_keep_replies_in_their_own_thread(self, adapter):
         posts = {}
 
-        async def create(chat_id, body):
+        async def create(chat_id, body, **kwargs):
             name = f"{chat_id}/messages/{len(posts) + 1}"
             posts[name] = {
                 "thread": (body.get("thread") or {}).get("name"),
@@ -912,7 +912,7 @@ class TestTypingLifecycle:
             }
             return type("Result", (), {"success": True, "message_id": name})()
 
-        async def patch(name, body):
+        async def patch(name, body, **kwargs):
             posts[name]["text"] = body["text"]
             return type("Result", (), {"success": True, "message_id": name})()
 
@@ -950,7 +950,7 @@ class TestTypingLifecycle:
         first_call_started = asyncio.Event()
         release_first_call = asyncio.Event()
 
-        async def _slow_create(chat_id, body):
+        async def _slow_create(chat_id, body, **kwargs):
             nonlocal call_count
             call_count += 1
             first_call_started.set()
@@ -990,7 +990,7 @@ class TestTypingLifecycle:
         first_call_started = asyncio.Event()
         release_first_call = asyncio.Event()
 
-        async def _slow_create(chat_id, body):
+        async def _slow_create(chat_id, body, **kwargs):
             first_call_started.set()
             await release_first_call.wait()
             return type("R", (), {"success": True,
@@ -1940,6 +1940,8 @@ class TestGoogleChatStandaloneSend:
         assert result == {
             "success": True,
             "message_id": "spaces/AAA/messages/MMM",
+            "thread_id": None,
+            "context_recorded": False,
         }
         fake_creds.refresh.assert_called_once()
         assert len(session.calls) == 1

@@ -350,6 +350,30 @@ class TestPersistence:
         assert mc == {"cwd": "/work", "provider": "anthropic",
                       "base_url": "https://anthropic.example/v1", "api_mode": "anthropic_messages"}
 
+    def test_persist_after_fallback_keeps_primary_route(self, tmp_path):
+        """A turn that fell back leaves the agent on the fallback route; the saved row must keep the
+        primary route, or restoring it pairs the primary model with the fallback provider."""
+        agent = SimpleNamespace(
+            model="gpt-6.1-sol", provider="custom", requested_provider="custom:cliproxyapi",
+            base_url="http://proxy.example/v1", api_mode="chat_completions", _fallback_activated=True,
+            _primary_runtime={"model": "claude-opus-5-5", "provider": "claude-subscription-directsdk-experimental",
+                              "requested_provider": "claude-subscription-directsdk-experimental",
+                              "base_url": "process://claude-subscription-directsdk-experimental",
+                              "api_mode": "chat_completions"},
+        )
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=lambda: agent, db=db)
+        state = manager.create_session(cwd="/work")
+        state.model = "claude-opus-5-5"
+        state.history.append({"role": "user", "content": "hello"})
+        manager.save_session(state.session_id)
+
+        row = db.get_session(state.session_id)
+        assert row["model"] == "claude-opus-5-5"
+        assert json.loads(row["model_config"]) == {
+            "cwd": "/work", "provider": "claude-subscription-directsdk-experimental",
+            "base_url": "process://claude-subscription-directsdk-experimental", "api_mode": "chat_completions"}
+
 
 
 

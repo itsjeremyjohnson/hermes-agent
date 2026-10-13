@@ -196,3 +196,166 @@ def test_non_dict_deferred_receipt_is_skipped_by_the_drain_and_fails_exact_id_re
     with pytest.raises(ValueError):
         queue.defer("e" * 64, {"id": "job"}, "same id", "", tmp_path)
     assert bad.read_text(encoding="utf-8") == payload
+
+
+def _bot_chat_home(home):
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session(session_id="chat", source="cli")
+    db.set_session_title("chat", "Bot Chat")
+    return db
+
+
+def _sibling_takes_session_then_child_runs(home, stderr, turns):
+    """The ``hermes chat -Q`` child boundary: the first launch loses the lease to a sibling that
+    claimed it after the parent's probe and exits with ``stderr``; later launches record the
+    query they were handed in ``turns``. That counts child submissions, not persisted session turns."""
+    from hermes_cli.active_sessions import format_refusal_stderr
+    sibling = []
+
+    def run(argv, env, report_path, timeout):
+        if not sibling:
+            lease, _ = try_acquire_active_session(session_id="chat", surface="cli", config={}, registry_home=home)
+            _, refusal = try_acquire_active_session(session_id="chat", surface="cli", config={}, registry_home=home,
+                                                    metadata={"live_session_id": "child"})
+            sibling.append(lease)
+            text = stderr.replace("{refusal}", format_refusal_stderr(refusal))
+            return subprocess.CompletedProcess(argv, 1, "", text)
+        turns.append(Path(argv[argv.index("--query-file") + 1]).read_text(encoding="utf-8"))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    return run, sibling
+
+
+# The marker sits behind an update warning and ahead of more stderr than the persisted
+# diagnostic tail keeps, as in the Oct 5 rm-hosting reader refusal.
+_REFUSAL = "Update available: run `hermes update`\n{refusal}\n" + "x" * 600
+_NOT_A_REFUSAL = [pytest.param("Traceback: provider exploded", id="generic-exit"),
+                  pytest.param("hermes-refusal-reason: SESSION_NOT_OWNED_EXTRA\nunknown", id="unknown-marker"),
+                  pytest.param("hermes-refusal-reason: SESSION_COORDINATION_UNAVAILABLE\ncannot tell",
+                               id="coordination-unavailable")]
+
+
+@pytest.mark.parametrize("for_failure", [False, True])
+def test_child_session_not_owned_after_probe_queues_then_settles_once(tmp_path, monkeypatch, for_failure):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = _bot_chat_home(tmp_path)
+    turns = []
+    run, sibling = _sibling_takes_session_then_child_runs(tmp_path, _REFUSAL, turns)
+    monkeypatch.setattr(delivery, "_run_bot_chat_turn", run)
+    job = {"id": "reader", "execution_id": "execution"}
+    try:
+        outcome = delivery._deliver_to_bot_chat(job, "NEW alert", "", for_failure=for_failure)
+        assert sibling, "the probe saw no owner, so the child was launched"
+        receipt = job["_bot_chat_delivery_receipts"]["bot-chat:(own)"]
+        key = receipt["delivery_id"]
+        assert receipt["status"] == "queued"
+        assert outcome == f"bot-chat:(own) queued (receipt {key}): completion unverified; do not resend"
+        record = queue.read_pending(key)
+        assert (record["status"], record["content"], record["home"], bool(record.get("for_failure"))) == (
+            "queued", "NEW alert", str(tmp_path.resolve()), for_failure)
+        # The same execution re-admitted while the sibling holds the session stays on its original key.
+        assert delivery._deliver_to_bot_chat(job, "NEW alert", "", for_failure=for_failure) == outcome
+        queue.drain()
+        assert turns == []
+        sibling[0].release()
+        queue.drain()
+        assert queue.read_pending(key)["status"] == "settled"
+        queue.drain()
+        assert len(turns) == 1 and "NEW alert" in turns[0]
+    finally:
+        for lease in sibling:
+            lease.release()
+        db.close()
+
+
+@pytest.mark.parametrize("stderr", _NOT_A_REFUSAL)
+def test_untyped_child_failure_after_probe_is_not_queued(tmp_path, monkeypatch, stderr):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = _bot_chat_home(tmp_path)
+    turns = []
+    run, sibling = _sibling_takes_session_then_child_runs(tmp_path, stderr, turns)
+    monkeypatch.setattr(delivery, "_run_bot_chat_turn", run)
+    job = {"id": "reader", "execution_id": "execution"}
+    try:
+        outcome = delivery._deliver_to_bot_chat(job, "NEW alert", "")
+        assert outcome.startswith("Hermes could not deliver this result to Bot Chat")
+        assert "_bot_chat_delivery_receipts" not in job
+        sibling[0].release()
+        queue.drain()
+        assert queue._records(queue._root()) == [] and turns == []
+    finally:
+        for lease in sibling:
+            lease.release()
+        db.close()
+
+
+@pytest.mark.parametrize("stderr, requeued", [
+    pytest.param(_REFUSAL, True, id="session-not-owned"),
+    *(pytest.param(p.values[0], False, id=p.id) for p in _NOT_A_REFUSAL)])
+def test_child_refusal_during_claimed_drain_requeues_then_settles_once(tmp_path, monkeypatch, stderr, requeued):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = _bot_chat_home(tmp_path)
+    turns = []
+    run, sibling = _sibling_takes_session_then_child_runs(tmp_path, stderr, turns)
+    monkeypatch.setattr(delivery, "_run_bot_chat_turn", run)
+    key = "c" * 64
+    queue.defer(key, {"id": "reader", "execution_id": "execution"}, "NEW alert", "", tmp_path.resolve())
+    try:
+        queue.drain()
+        assert sibling, "the drain claimed the record and launched its child"
+        record = queue.read_pending(key)
+        assert record["status"] == ("queued" if requeued else "ambiguous")
+        queue.drain()
+        assert turns == []
+        sibling[0].release()
+        queue.drain()
+        queue.drain()
+        assert queue.read_pending(key)["status"] == ("settled" if requeued else "ambiguous")
+        assert len(turns) == (1 if requeued else 0)
+    finally:
+        for lease in sibling:
+            lease.release()
+        db.close()
+
+
+def test_suppression_after_a_refused_drain_releases_its_claim_stands(tmp_path, monkeypatch):
+    """A failure route ``bot-chat,bot-chat:default`` admits the same key twice. If the second
+    alias suppresses the record after a refused drain re-queued it, the drain must not overwrite
+    that suppression with its own ``ambiguous`` disposition or record a failed incident delivery."""
+    from cron import incidents
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(incidents, "EXECUTIONS_FILE", tmp_path / "cron/executions.db")
+    incident_id, _ = incidents.upsert_incident("reader", "provider 503")
+    db = _bot_chat_home(tmp_path)
+    turns = []
+    run, sibling = _sibling_takes_session_then_child_runs(tmp_path, _REFUSAL, turns)
+    monkeypatch.setattr(delivery, "_run_bot_chat_turn", run)
+    job = {"id": "reader", "execution_id": "execution", "_failure_incident_ids": [incident_id]}
+    owner, _ = try_acquire_active_session(session_id="chat", surface="cli", config={}, registry_home=tmp_path)
+    delivery._deliver_to_bot_chat(dict(job), "NEW alert", "", for_failure=True)
+    owner.release()
+    key = queue._records(queue._root())[0][1]["id"]
+    release_claim = queue.release_claim
+
+    def release_then_alias_suppresses(released_key):
+        record = release_claim(released_key)
+        (tmp_path / "config.yaml").write_text("display: {suppress_warning_notifications: true}")
+        alias = dict(job)
+        assert delivery._deliver_to_bot_chat(alias, "NEW alert", "default", for_failure=True) is None
+        assert alias["_bot_chat_delivery_receipts"]["bot-chat:default"] == {"status": "suppressed", "delivery_id": key}
+        return record
+
+    monkeypatch.setattr(queue, "release_claim", release_then_alias_suppresses)
+    try:
+        queue.drain()
+        assert sibling, "the drain claimed the record and its child was refused"
+        assert queue.read_pending(key)["status"] == "suppressed"
+        incident = incidents.get_incident(incident_id)
+        assert (incident["state"], incident["alerted_at"], incident["undelivered_at"]) == ("detected", None, None)
+        sibling[0].release()
+        queue.drain()
+        queue.drain()
+        assert queue.read_pending(key)["status"] == "suppressed" and turns == []
+    finally:
+        for lease in sibling:
+            lease.release()
+        db.close()
