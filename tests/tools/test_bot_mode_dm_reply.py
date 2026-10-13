@@ -40,6 +40,9 @@ _SENDER = textwrap.dedent("""
     from tools.process_registry import process_registry
 
     mode, home, fake_hermes = sys.argv[2:5]
+    if len(sys.argv) > 5:  # a vault fill this turn: only this process can scrub the value
+        from agent.redact import register_vault_redaction_value
+        register_vault_redaction_value(sys.argv[5])
     bot_relay._hermes_cli = lambda: fake_hermes
     db = SessionDB(db_path=Path(home) / "state.db")
     db.create_session("bot-chat", source="cli")
@@ -60,7 +63,7 @@ _SENDER = textwrap.dedent("""
 """)
 
 
-def _setup(tmp_path):
+def _setup(tmp_path, reply=REPLY):
     home = tmp_path / "home"
     profile = home / "profiles" / "researcher"
     profile.mkdir(parents=True)
@@ -74,7 +77,7 @@ def _setup(tmp_path):
         "import os, time\n"
         f"while not os.path.exists({str(gate)!r}):\n"
         "    time.sleep(0.05)\n"
-        f"print({REPLY!r})\n", encoding="utf-8")
+        f"print({reply!r})\n", encoding="utf-8")
     fake_hermes.chmod(0o755)
     sender = tmp_path / "sender.py"
     sender.write_text(_SENDER, encoding="utf-8")
@@ -390,3 +393,94 @@ def test_turn_admission_never_waits_on_a_reply_record_another_party_holds(tmp_pa
     assert result["history"] == []
     assert [m["content"].count("reply for n") > 0 for m in later_n] == [True]
     assert [m["content"].count("reply for m") > 0 for m in later_m] == [True]
+
+
+VAULT = "opaque-vault-value-4391"
+
+
+def _stored(home):
+    """Every byte of every transcript row, display metadata included."""
+    import sqlite3
+
+    with contextlib.closing(sqlite3.connect(home / "state.db")) as conn:
+        rows = conn.execute("SELECT * FROM messages").fetchall()
+    return "\n".join(v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v) for row in rows for v in row)
+
+
+def _records(tmp_path):
+    return [json.loads(p.read_text(encoding="utf-8")) for p in (tmp_path / "tmp").glob("hermes-dm-*/*.reply.json")]
+
+
+@pytest.mark.live_system_guard_bypass  # the "admission" case SIGKILLs this test's own reparented runner
+@pytest.mark.parametrize("mode", ["linger_delivers", "runner", "admission"])
+def test_a_reply_never_publishes_the_senders_vault_values_from_another_process(tmp_path, monkeypatch, mode):
+    """Vault values live only in the memory of the sender that registered them. Its own consumer
+    masks them (``linger_delivers``); a delivery by the runner or by a later turn's admission runs
+    in another interpreter that cannot, so it must withhold the reply and say where it is kept."""
+    from hermes_cli.active_sessions import release_active_session, try_acquire_active_session
+    from hermes_state import SessionDB
+
+    home, gate, fake_hermes, sender, env = _setup(tmp_path, reply=f"{REPLY} {VAULT}")
+    if mode == "linger_delivers":
+        gate.touch()
+    run = subprocess.run([sys.executable, str(sender), str(REPO),
+                          "linger_delivers" if mode == "linger_delivers" else "exits_before_reply",
+                          str(home), str(fake_hermes), VAULT], env=env, capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr
+    notifications = json.loads(run.stdout.strip().splitlines()[-1])
+
+    surface = None
+    if mode == "admission":  # an idle surface holds the chat, so only the next turn's admission delivers
+        surface, refusal = try_acquire_active_session(session_id="bot-chat", surface="desktop", config={},
+                                                      registry_home=home)
+        assert refusal is None
+    try:
+        gate.touch()
+        deadline = time.monotonic() + 30
+        if mode == "runner":  # until the runner appended its row and settled the record
+            while ((not _messages(home) or any(r["state"] != "withheld" for r in _records(tmp_path)))
+                   and time.monotonic() < deadline):
+                time.sleep(0.1)
+        elif mode == "admission":
+            while [r["state"] for r in _records(tmp_path)] != ["pending"] and time.monotonic() < deadline:
+                time.sleep(0.1)
+            _kill_runners(tmp_path)
+            monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+            db = SessionDB(db_path=home / "state.db")
+            try:
+                _admit(db, "bot-chat")
+            finally:
+                db.close()
+    finally:
+        if surface is not None:
+            release_active_session(surface)
+
+    assert VAULT not in json.dumps(notifications) + _stored(home)
+    if mode == "linger_delivers":
+        assert [("«redacted-vault-secret»" in n, REPLY in n) for n in notifications] == [(True, True)]
+        assert (_messages(home), _records(tmp_path)) == ([], [])
+        return
+    [record] = _records(tmp_path)
+    [row] = _messages(home)
+    assert (record["state"], VAULT in record["output"]) == ("withheld", True)  # kept on disk for an operator
+    assert (REPLY in row["content"], "withheld" in row["content"]) == (False, True)
+    assert str(next((tmp_path / "tmp").glob("hermes-dm-*/*.reply.json"))) in row["content"]
+
+
+def test_a_failure_while_binding_the_owners_scope_leaves_the_callers_scope_intact(tmp_path, monkeypatch):
+    from agent import secret_scope
+    from agent.secret_scope import get_secret
+    from hermes_constants import get_hermes_home
+    from tools.bot_mode_dm_reply import _owner_scope
+
+    home_a, home_b = _profile(tmp_path / "a", redact=False), _profile(tmp_path / "b", redact=False)
+    (home_a / ".env").write_text("OWNER_KEY=A\n", encoding="utf-8")
+    (home_b / ".env").write_text("OWNER_KEY=B\n", encoding="utf-8")
+    with _owner_scope(str(home_a)):
+        monkeypatch.setattr(secret_scope, "build_profile_secret_scope",
+                            lambda home: (_ for _ in ()).throw(OSError("unreadable profile")))
+        with pytest.raises(OSError):
+            with _owner_scope(str(home_b)):
+                pass
+        after = (get_hermes_home(), get_secret("OWNER_KEY"))
+    assert after == (home_a, "A")

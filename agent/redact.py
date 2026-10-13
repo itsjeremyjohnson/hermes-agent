@@ -63,6 +63,13 @@ def clear_vault_redaction_values() -> None:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
 
 
+def has_registered_vault_values(hermes_home: str) -> bool:
+    """Whether this process holds vault values for the profile at ``hermes_home``. Another process
+    cannot scrub them, so output it publishes for that profile must not carry raw tool output."""
+    with _VAULT_REDACTION_LOCK:
+        return bool(_VAULT_REDACTION_VALUES.get(str(hermes_home)))
+
+
 def redact_registered_vault_values(text: str) -> str:
     """Exact-substring scrub of every vault secret value registered for the current profile."""
     if not isinstance(text, str) or not text:

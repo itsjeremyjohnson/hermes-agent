@@ -695,7 +695,7 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
         proc = process_registry.get(proc_id)
         try:
             durable = arm(reply_record, proc, db_path=getattr(getattr(agent, "_session_db", None), "db_path", None),
-                          session_id=getattr(agent, "session_id", None))
+                          session_id=getattr(agent, "session_id", None), label=label)
         except Exception as exc:
             # The runner is already delivering: an error here would make the sender resend.
             logger.warning("message_agent: reply of %s will not survive this process: %s", proc_id, exc)

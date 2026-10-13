@@ -25,9 +25,12 @@ outcome takes the conversation's turn lease itself while no live surface holds t
 record; no surface's lifetime discards it.
 
 The DM directory is per OS user and shared by every profile, so a record names its owner's
-``HERMES_HOME``. :func:`deliver` binds that profile's scope (redaction policy, vault values,
-secrets) whatever process runs it; admission is already bound to its own conversation's profile.
-The DM sweeper never delivers: it only removes records whose parties are gone.
+``HERMES_HOME``. :func:`deliver` binds that profile's scope (redaction policy, secrets) whatever
+process runs it; admission is already bound to its own conversation's profile. Vault values are
+the exception: they live only in the sender's memory, so when the sender held any, a delivery
+from another interpreter (the runner, a later turn's admission) appends a notice naming the
+record instead of the reply, and the record stays on disk as ``withheld``. The DM sweeper never
+delivers: it only removes records whose parties are gone.
 """
 
 from __future__ import annotations
@@ -56,7 +59,10 @@ _DELIVERY_LEASE_TTL_SECONDS = 60.0
 # A ``pending`` record nobody could deliver for this long (state.db gone, conversation never resumed)
 # is dropped by the DM sweeper. ``handoff`` gets the same horizon: its runner may still be running.
 PENDING_MAX_AGE_SECONDS = 7 * 24 * 3600
-_LONG_LIVED_STATES = ("handoff", "pending")
+_LONG_LIVED_STATES = ("handoff", "pending", "withheld")
+# Identifies this interpreter in the records it arms. Vault values live only in the memory of the
+# process that registered them, so only the sender's own interpreter can scrub them from a reply.
+_INTERPRETER = uuid.uuid4().hex
 
 _armed: dict[str, Any] = {}  # record path -> ProcessSession, for runners this process spawned
 _armed_lock = threading.Lock()
@@ -106,15 +112,15 @@ def _owner_scope(hermes_home: str):
 
     home = Path(hermes_home)
     is_launch_home = home.resolve() == Path(get_process_hermes_home()).resolve()
-    home_token = set_hermes_home_override(str(home))
-    secret_token = set_secret_scope(launch_secret_scope(home) if is_launch_home else build_profile_secret_scope(home))
-    terminal_token = install_profile_terminal_scope(home, env_overlay=launch_terminal_env() if is_launch_home else None)
-    try:
+    # Each reset is registered as soon as its setter returns, so a failure part-way through entry
+    # restores what was already bound instead of leaking it into the caller.
+    with contextlib.ExitStack() as stack:
+        stack.callback(reset_hermes_home_override, set_hermes_home_override(str(home)))
+        stack.callback(reset_secret_scope, set_secret_scope(
+            launch_secret_scope(home) if is_launch_home else build_profile_secret_scope(home)))
+        stack.callback(reset_terminal_scope, install_profile_terminal_scope(
+            home, env_overlay=launch_terminal_env() if is_launch_home else None))
         yield
-    finally:
-        reset_terminal_scope(terminal_token)
-        reset_secret_scope(secret_token)
-        reset_hermes_home_override(home_token)
 
 
 def _read(path: str) -> Optional[dict]:
@@ -136,7 +142,7 @@ def _discard(path: str) -> None:
             os.unlink(name)
 
 
-def arm(path: str, proc: Any, *, db_path: str, session_id: str) -> bool:
+def arm(path: str, proc: Any, *, db_path: str, session_id: str, label: str = "") -> bool:
     """Sender side, right after spawn: open the record so the reply survives this process.
     Skipped for gateway-watched processes: a watcher delivers those and checkpoint recovery
     re-arms it after a restart, so a runner-side row would duplicate it."""
@@ -146,9 +152,11 @@ def arm(path: str, proc: Any, *, db_path: str, session_id: str) -> bool:
 
     global _atexit_registered
     _reap_delivered()
+    record = {"state": "armed", "proc_id": proc.id, "command": proc.command, "label": label,
+              "db_path": str(db_path), "session_id": session_id, "hermes_home": str(get_hermes_home()),
+              "armed_by": _INTERPRETER}
     with _locked(path):
-        _write(path, {"state": "armed", "proc_id": proc.id, "command": proc.command,
-                      "db_path": str(db_path), "session_id": session_id, "hermes_home": str(get_hermes_home())})
+        _write(path, _note_vault(record))
     with _armed_lock:
         _armed[path] = proc
         if not _atexit_registered:
@@ -182,6 +190,7 @@ def settle(path: str, proc: Any, *, exiting: bool) -> bool:
             _discard(path)
             _forget(path)
             return False
+        _note_vault(record)
         if record["state"] == "armed":
             if not proc._completion_event.is_set():
                 if exiting:
@@ -253,13 +262,13 @@ def deliver(path: str) -> bool:
         if not record.get("hermes_home") or not Path(record["db_path"]).is_file():
             return False
         with _owner_scope(record["hermes_home"]):
-            delivered = _deliver_locked(record)
+            delivered = _deliver_locked(path, record)
         if delivered:
-            _discard(path)
+            _delivered(path, record)
         return delivered
 
 
-def _deliver_locked(record: dict) -> bool:
+def _deliver_locked(path: str, record: dict) -> bool:
     from hermes_state_registry import acquire, release_or_close
 
     db = acquire(Path(record["db_path"]))
@@ -272,7 +281,7 @@ def _deliver_locked(record: dict) -> bool:
         try:
             if _surface_holds(Path(record["db_path"]).parent, db, session_id):
                 return False
-            _append_row(db, session_id, record, turn_lease_holder=holder)
+            _append_row(db, session_id, path, record, turn_lease_holder=holder)
         finally:
             db.release_session_turn_lease(session_id, holder)
     finally:
@@ -301,8 +310,8 @@ def deliver_pending(db: Any, session_id: str, turn_lease_holder: str) -> int:
             with _try_locked(path) as locked:
                 if not locked or not _addressed_to(record := _read(path), db, db_path, tip):
                     continue
-                _append_row(db, tip, record, turn_lease_holder=turn_lease_holder)
-                _discard(path)
+                _append_row(db, tip, path, record, turn_lease_holder=turn_lease_holder)
+                _delivered(path, record)
                 delivered += 1
         except Exception as exc:
             logger.warning("message_agent: could not deliver pending reply %s: %s", path, exc)
@@ -362,6 +371,31 @@ def _surface_holds(home: Path, db: Any, tip: str) -> bool:
     return False
 
 
+def _note_vault(record: dict) -> dict:
+    """Sender side: flag the record (once set, for good) when this process holds vault values for
+    the owner's profile. Only a flag: the values themselves never leave this process's memory."""
+    from agent.redact import has_registered_vault_values
+
+    if record.get("hermes_home") and has_registered_vault_values(record["hermes_home"]):
+        record["vault_guarded"] = True
+    return record
+
+
+def _withheld(record: dict) -> bool:
+    """Whether the reply may carry the sender's vault values and this interpreter cannot scrub them."""
+    return bool(record.get("vault_guarded")) and record.get("armed_by") != _INTERPRETER
+
+
+def _delivered(path: str, record: dict) -> None:
+    """Called under the record lock once its row is appended. A withheld reply's record stays on
+    disk (``withheld``, never delivered again) for an operator until the 7-day sweep."""
+    if _withheld(record):
+        record["state"] = "withheld"
+        _write(path, record)
+    else:
+        _discard(path)
+
+
 def _forget(path: str) -> None:
     with _armed_lock:
         _armed.pop(path, None)
@@ -408,9 +442,10 @@ def _settle_all_at_exit() -> None:
             logger.warning("message_agent: could not hand off the reply of %s: %s", proc.id, exc)
 
 
-def _append_row(db: Any, session_id: str, record: dict, *, turn_lease_holder: str) -> None:
+def _append_row(db: Any, session_id: str, path: str, record: dict, *, turn_lease_holder: str) -> None:
     """The DELIVERY row a push surface persists for the same completion, written under the
-    conversation's turn lease (the append transaction re-checks ``turn_lease_holder``)."""
+    conversation's turn lease (the append transaction re-checks ``turn_lease_holder``). A
+    :func:`_withheld` reply is replaced by a notice that names its record."""
     from tools.bot_mode_dm import REPLY_COMPLETION_CHARS
     from tools.process_registry import _redact_process_result
     from tools.process_registry_notifications import (
@@ -418,6 +453,10 @@ def _append_row(db: Any, session_id: str, record: dict, *, turn_lease_holder: st
     )
 
     output = record.get("output") or ""
+    if _withheld(record):
+        output = (f"The reply from {record.get('label') or 'the teammate'} arrived after the sending session "
+                  "exited. It is withheld from this transcript because that session held vault secrets that "
+                  f"only it could redact. An operator can read it in {path} (kept for 7 days).")
     evt = {"type": "completion", "session_id": record["proc_id"], "command": record["command"],
            "exit_code": record.get("exit_code"), "completion_reason": record.get("completion_reason", "exited"),
            "output": output[-REPLY_COMPLETION_CHARS:]}
