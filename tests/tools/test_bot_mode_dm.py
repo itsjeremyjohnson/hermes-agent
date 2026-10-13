@@ -1235,21 +1235,26 @@ def test_poll_reply_is_persisted_as_a_delivery_row_when_the_runner_exits(tmp_pat
                            "notify_on_complete": False})
 
     monkeypatch.setattr(terminal_tool_module, "terminal_tool", fake_terminal_tool)
+    monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
     home = _managed_home(tmp_path, teammates=("researcher",))
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("sess-1", source="cli")
     agent = _FakeAgent(home, title="Bot Chat")
-    rows = []
-    agent._session_db.append_message = lambda session_id, role, **kw: rows.append((session_id, role, kw)) or 1
+
+    def delivery_rows():
+        return [m for m in db.get_messages("sess-1") if m.get("display_kind") == "process_complete"]
 
     result = json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent))
     assert result["reply_delivery"] == "poll"
     assert "transcript" in result["detail"]
     deadline = time.monotonic() + 10
-    while not rows and time.monotonic() < deadline:
+    while not delivery_rows() and time.monotonic() < deadline:
         time.sleep(0.05)
+    rows = delivery_rows()
     assert len(rows) == 1
-    session_id, role, kw = rows[0]
-    assert (session_id, role) == ("sess-1", "user")
-    assert kw["display_kind"] == "process_complete"
-    assert "PAYLOAD_SENTINEL_42" in kw["content"]
-    assert procs[0].id in kw["content"]
-    assert kw["display_metadata"]["display_text"].startswith("Background Process Finished")
+    assert rows[0]["role"] == "user"
+    assert "PAYLOAD_SENTINEL_42" in rows[0]["content"]
+    assert procs[0].id in rows[0]["content"]
+    assert rows[0]["display_metadata"]["display_text"].startswith("Background Process Finished")

@@ -26,7 +26,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -344,10 +343,13 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
         return None
 
 
-def _dm_dir() -> Path:
+def _dm_dir(*, create: bool = True) -> Optional[Path]:
+    """The per-user DM directory; ``create=False`` returns None when it does not exist yet."""
     uid_getter = getattr(os, "getuid", None)
     uid = uid_getter() if callable(uid_getter) else None
     path = Path(tempfile.gettempdir()) / (f"{_DM_DIR_NAME}-{uid}" if uid is not None else _DM_DIR_NAME)
+    if not create and not os.path.lexists(path):
+        return None
     path.mkdir(mode=0o700, exist_ok=True)
     # Shared POSIX temp roots need a per-user directory. Fail closed if an
     # attacker pre-created the expected path or replaced it with a symlink.
@@ -377,7 +379,13 @@ def cleanup_bot_dm_cache(max_age_hours: float = _DM_STALE_SECONDS / 3600, *, now
         locations.append((dm_dir, "*.live.json"))
     from tools.bot_relay import unlink_files_older_than
 
-    return sum(unlink_files_older_than(d, pattern, cutoff) for d, pattern in locations)
+    removed = sum(unlink_files_older_than(d, pattern, cutoff) for d, pattern in locations)
+    with contextlib.suppress(OSError):
+        # Reply records: removal only; pending outcomes keep a longer horizon (see sweep).
+        from tools.bot_mode_dm_reply import sweep
+
+        removed += sweep(_dm_dir(), cutoff)
+    return removed
 
 
 def _unlink_dm_file(path: str) -> None:
@@ -605,6 +613,14 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
     return shlex.join(runner_argv)
 
 
+def _reply_record_prefix(record_path: str) -> str:
+    """``--reply-record`` wrapper argv placed ahead of any runner command (see ``tools/bot_mode_dm_reply.py``)."""
+    argv = [sys.executable, str(Path(__file__).resolve()), "--reply-record", record_path]
+    if sys.platform == "win32":
+        argv = [part.replace("\\", "/") for part in argv]  # same Git Bash rule as _delivery_command
+    return shlex.join(argv)
+
+
 def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bool,
                     task_id: Optional[str], agent: Any, profile_home: Path | None = None,
                     author: Optional[dict] = None) -> str:
@@ -648,8 +664,12 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
     to a background process, never a delivery receipt."""
     transferred = False
     try:
+        from tools.bot_mode_dm_reply import arm, new_record_path, settle_when_done
         from tools.terminal_tool import terminal_tool
 
+        # The runner settles the reply record itself, so the reply survives a sender that exits first.
+        reply_record = new_record_path(_dm_dir())
+        command = _reply_record_prefix(reply_record) + " " + command
         raw = terminal_tool(command, background=True, notify_on_complete=True, task_id=task_id,
                             workdir=str(Path(__file__).resolve().parent.parent), _host_local=True,
                             _completion_output_chars=REPLY_COMPLETION_CHARS)
@@ -670,6 +690,16 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
             return _err(f"Delivery to {label} failed to start: no process id returned")
         # From here the background runner owns the file (removed after the consumer finishes).
         transferred = True
+        from tools.process_registry import process_registry
+
+        proc = process_registry.get(proc_id)
+        try:
+            durable = arm(reply_record, proc, db_path=getattr(getattr(agent, "_session_db", None), "db_path", None),
+                          session_id=getattr(agent, "session_id", None), label=label)
+        except Exception as exc:
+            # The runner is already delivering: an error here would make the sender resend.
+            logger.warning("message_agent: reply of %s will not survive this process: %s", proc_id, exc)
+            durable = False
         if parsed.get("notify_on_complete") is False:
             # terminal_tool refused the completion promise: this session (api_server, one-shot
             # runner) cannot receive an async completion, so the recipient's reply would never
@@ -680,7 +710,8 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
                       f"session_id='{proc_id}') — its output is the reply (relay it, attributed to that "
                       "agent) or the delivery failure (report it; the message was NOT delivered); "
                       "if wait returns status=timeout, call wait again until the process exits.")
-            if _persist_reply_when_done(proc_id, agent):
+            if durable:
+                settle_when_done(reply_record, proc)
                 detail += (" Its outcome is also saved into this session's transcript as a delivery row "
                            "when the process exits, so it survives even if the turn ends first.")
         else:
@@ -708,42 +739,6 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
     finally:
         if dm_file and not transferred:
             _unlink_dm_file(dm_file)
-
-
-def _persist_reply_when_done(proc_id: str, agent: Any) -> bool:
-    """#101142 durable leg. A non-push sender (api_server, one-shot runner) gets no completion
-    notification, so once the tracked runner exits its stdout — the recipient's reply or the
-    delivery failure — is appended to the sender's session transcript as a DELIVERY row
-    (``display_kind="process_complete"``, the shape push surfaces persist for the same
-    completion; mirrors gateway.wake.persist_delegation_delivery). A sender that already read
-    the outcome via process(action='wait'/'log') is not told twice. Returns False (nothing
-    armed) when the sender has no session transcript or the process is not tracked here."""
-    from tools.process_registry import process_registry
-
-    db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
-    proc = process_registry.get(proc_id)
-    if proc is None or not session_id or not callable(getattr(db, "append_message", None)):
-        return False
-
-    def _run() -> None:
-        from tools.process_registry_notifications import (
-            format_process_notification, process_completion_display_text,
-        )
-
-        proc._completion_event.wait()
-        if process_registry.is_completion_consumed(proc_id):
-            return
-        evt = {"type": "completion", "session_id": proc_id, **process_registry._exit_snapshot(proc, "exited")}
-        try:
-            db.append_message(session_id, "user", content=format_process_notification(evt),
-                              display_kind="process_complete",
-                              display_metadata={"display_text": process_completion_display_text([evt])})
-        except Exception as exc:
-            logger.warning("message_agent: could not persist the reply of %s into session %s: %s",
-                           proc_id, session_id, exc)
-
-    threading.Thread(target=_run, name=f"message-agent-reply-{proc_id}", daemon=True).start()
-    return True
 
 
 def _wait_reply_main(reply_path: str, label: str, budget_seconds: str) -> int:
@@ -777,8 +772,13 @@ def _wait_reply_main(reply_path: str, label: str, budget_seconds: str) -> int:
 
 
 def _delivery_main(args: list[str]) -> int:
-    """Runner entry for the argv ``_delivery_command`` and ``bot_relay.waiter_command`` build.
-    Malformed argv exits 2 without touching the DM file."""
+    """Runner entry for the argv ``_delivery_command`` and ``bot_relay.waiter_command`` build, behind
+    the ``--reply-record <path>`` wrapper ``_spawn_delivery`` adds. Malformed argv exits 2 without
+    touching the DM file."""
+    if args[:1] == ["--reply-record"]:
+        from tools.bot_mode_dm_reply import run_and_settle
+
+        return run_and_settle(args[1], args[2:]) if len(args) > 2 else 2
     if args[:1] == ["--wait-reply"]:
         return _wait_reply_main(*args[1:]) if len(args) == 4 else 2
     if not args or args[0] != "--run-delivery":

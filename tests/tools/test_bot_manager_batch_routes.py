@@ -74,9 +74,10 @@ def test_inline_batch_peer_and_desktop_relay_keep_route_identity(tmp_path, monke
         assert result["results"][0]["result"]["status"] == "queued"
 
         waiter = shlex.split(calls[1]["command"])
-        assert waiter[1:3] == [str(Path(bot_mode_dm.__file__).resolve()), "--wait-reply"]
+        marker = waiter.index("--wait-reply")  # behind the --reply-record wrapper
+        assert waiter[marker - 1] == str(Path(bot_mode_dm.__file__).resolve())
         envelope_id = result["results"][1]["result"]["delivery_id"]
-        assert envelope_id and envelope_id in waiter[3]
+        assert envelope_id and envelope_id in waiter[marker + 1]
         envelope_path = bot_relay.relay_root(home) / bot_relay.OUTBOX_DIR / f"{envelope_id}.json"
         envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
         assert envelope["id"] == envelope_id

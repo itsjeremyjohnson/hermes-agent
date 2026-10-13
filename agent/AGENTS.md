@@ -18,6 +18,24 @@ config/provider later), `max_iterations` (default 500, shared with subagents),
 `chat(message) -> str` is the simple interface; `run_conversation(user_message, system_message=None,
 conversation_history=None, task_id=None) -> dict` returns `final_response` + `messages`.
 
+A transcript row written from outside a turn (a detached completion, a delivery row) must land at a
+turn boundary. A plain `append_message` can land inside a running turn's history, and a turn that
+acquired its lease without waiting never reloads. Hold the conversation's turn lease and pass
+`turn_lease_holder` (or `reject_active_turn_lease`), keep the payload when refused, and retry at a
+safe boundary. `tools/bot_mode_dm_reply.py` is the pattern: next-turn admission drains its pending rows.
+A parked payload names its owner's profile home, and any delivery outside that profile's turn binds
+its scope: per-user temp dirs are shared by every profile, so a maintenance sweep only removes.
+Admission drains never wait: filter by conversation before locking and use a non-blocking lock.
+Binding a scope does not carry vault values: `agent/redact.py` holds them in the registering
+process's memory only. Output that another process will publish for that profile records
+`has_registered_vault_values` from the owner, and once that flag is set the output is discarded:
+neither the parked payload nor the published row keeps it. Anything a later model can read is not
+a safe place for it: `agent.log`/`errors.log` and per-user temp dirs are open to `read_file`, and
+`display_metadata` reaches a model through `hermes sessions export`. The notice and its log line
+carry ids and labels only. A registration after the owner's last flag read must still guard the
+payload: register a fence with `agent.redact.add_vault_registration_fence` that flags the payload
+under its lock before the value exists.
+
 ## Agent loop (`agent/conversation_loop.py` + `agent/turn_*.py`)
 
 Entirely synchronous, with interrupt checks, budget tracking, and a one-turn grace call:

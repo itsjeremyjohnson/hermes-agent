@@ -4,6 +4,7 @@ Short tokens (< 18 chars) are fully masked; longer ones keep the first 6 and
 last 4 characters for debuggability.
 """
 
+import contextlib
 import logging
 import os
 import re
@@ -30,6 +31,12 @@ logger = logging.getLogger(__name__)
 _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
 _VAULT_REDACTION_LOCK = threading.Lock()
+# Held by a registration from its read of the fence list through its insert, and by a fence
+# installer, so a fence installed while a registration is in flight waits for it to finish: a value
+# either is registered before the installer returns or enters that fence. Outermost in the lock
+# order (lifecycle, then a fence's own locks, then _VAULT_REDACTION_LOCK); nothing that holds a later
+# lock takes this one.
+_VAULT_LIFECYCLE_LOCK = threading.Lock()
 
 
 def _vault_scope() -> str:
@@ -47,20 +54,44 @@ def register_vault_redaction_value(value) -> None:
     if not isinstance(value, str) or not value:
         return
     normalized = value.replace("\r", "").replace("\n", "")
-    with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
-        for v in (value, normalized):
-            if v:
-                bucket.pop(v, None)  # re-registering refreshes recency
-                bucket[v] = None
-        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
-            del bucket[next(iter(bucket))]
+    scope = _vault_scope()
+    with _VAULT_LIFECYCLE_LOCK, contextlib.ExitStack() as fences:
+        for fence in list(_VAULT_REGISTRATION_FENCES):
+            fences.enter_context(fence(scope))
+        with _VAULT_REDACTION_LOCK:
+            bucket = _VAULT_REDACTION_VALUES.setdefault(scope, {})
+            for v in (value, normalized):
+                if v:
+                    bucket.pop(v, None)  # re-registering refreshes recency
+                    bucket[v] = None
+            while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
+                del bucket[next(iter(bucket))]
+
+
+# Context managers ``fence(hermes_home)`` entered around every registration for that profile. A
+# party that published that profile's output for another process to deliver uses one to guard it
+# before the value exists, so no moment has the value registered and the published output unguarded.
+_VAULT_REGISTRATION_FENCES: list = []
+
+
+def add_vault_registration_fence(fence) -> None:
+    """Install ``fence``; returns once no registration that missed it is still in flight."""
+    with _VAULT_LIFECYCLE_LOCK:
+        if fence not in _VAULT_REGISTRATION_FENCES:
+            _VAULT_REGISTRATION_FENCES.append(fence)
 
 
 def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values (profile teardown / explicit lock)."""
     with _VAULT_REDACTION_LOCK:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
+
+
+def has_registered_vault_values(hermes_home: str) -> bool:
+    """Whether this process holds vault values for the profile at ``hermes_home``. Another process
+    cannot scrub them, so output it publishes for that profile must not carry raw tool output."""
+    with _VAULT_REDACTION_LOCK:
+        return bool(_VAULT_REDACTION_VALUES.get(str(hermes_home)))
 
 
 def redact_registered_vault_values(text: str) -> str:
