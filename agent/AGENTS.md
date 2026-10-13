@@ -29,6 +29,9 @@ Admission drains never wait: filter by conversation before locking and use a non
 Binding a scope does not carry vault values: `agent/redact.py` holds them in the registering
 process's memory only. A row published by another process for that profile records
 `has_registered_vault_values` from the owner and withholds raw tool output when it is set.
+The withheld row must not name where the raw output lives, in any column: `display_metadata`
+reaches a model through `hermes sessions export`, and a process `command` can embed file paths.
+Log the location for the operator instead.
 
 ## Agent loop (`agent/conversation_loop.py` + `agent/turn_*.py`)
 
