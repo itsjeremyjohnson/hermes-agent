@@ -323,7 +323,15 @@ class TestCloudflareHeadedRelaunch:
             return _Resp()
 
         monkeypatch.setattr(requests, "get", fake_get)
-        cli = _fake_cli(tmp_path, "cat\n")  # echoes the code it was sent
+        # Runs the submitted code against stub tab helpers that print which tab they make visible.
+        stubs = tmp_path / "stubs.py"
+        stubs.write_text(
+            "def current_tab(): return 'T0'\n"
+            "def activate_tab(t): print('activated', t)\n"
+            "def new_tab(url='about:blank'): return 'T1'\n"
+            "def switch_tab(t, activate=False): activate and print('activated', t)\n", encoding="utf-8")
+        cli = _fake_cli(tmp_path, f'exec "{sys.executable}" -c "import sys; ns={{}}; '
+                                  f'exec(open(\'{stubs}\').read(), ns); exec(sys.stdin.read(), ns)"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         return launches, probes
 
@@ -341,8 +349,8 @@ class TestCloudflareHeadedRelaunch:
         assert "browser_notice" not in second  # already headed: never relaunch in a loop
         assert launches[2:] == [("bu-named-hs", "get", True)]
         # only the headed window gets its tabs shown (key events reach visible tabs only)
-        assert not first["output"].startswith(bu_cli._SHOW_TABS_PREAMBLE)
-        assert second["output"].startswith(bu_cli._SHOW_TABS_PREAMBLE)
+        assert "activated" not in first["output"]  # headless: the harness keeps its background tabs
+        assert "activated T0" in second["output"]  # headed: the working tab is shown so key events land
 
     def test_show_tabs_preamble_activates_the_working_tab_and_tabs_the_code_opens(self):
         calls = []
