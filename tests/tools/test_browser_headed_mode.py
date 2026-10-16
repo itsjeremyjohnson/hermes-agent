@@ -136,17 +136,23 @@ class TestHeadedFlagInjection:
     @patch("tools.browser_tool_cloud._get_cloud_provider", return_value=None)
     @patch("tools.browser_tool_cdp._get_cdp_override", return_value="")
     @patch("tools.browser_tool._is_camofox_mode", return_value=False)
-    def test_headed_flag_added_in_local_mode(
-        self, _camofox, _cdp, _cloud, _chromium, _local, _find, _session
+    @pytest.mark.parametrize("global_headed,key_headed,expected", [
+        (False, False, False),
+        (True, False, True),
+        (False, True, True),  # relaunched headed after a Cloudflare challenge (browser_use_cli)
+    ])
+    def test_headed_flag_in_local_mode(
+        self, _camofox, _cdp, _cloud, _chromium, _local, _find, _session, global_headed, key_headed, expected
     ):
         import tools.browser_tool as bt
-        bt._cached_headed_mode = True
+        bt._cached_headed_mode = global_headed
         bt._headed_mode_resolved = True
         _session.return_value = {"session_name": "test-sess"}
 
-        captured = self._run_and_capture(bt)
+        with patch.object(bt, "_headed_session_keys", {"task1"} if key_headed else set()):
+            captured = self._run_and_capture(bt)
         assert len(captured) == 1
-        assert "--headed" in captured[0]
+        assert ("--headed" in captured[0]) is expected
 
 
     @patch("tools.browser_tool_session._get_session_info")

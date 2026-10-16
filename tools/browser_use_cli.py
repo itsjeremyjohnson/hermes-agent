@@ -31,6 +31,11 @@ _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # Set on the env dict by the CDP resolvers when the resolved browser is EXCLUSIVE to this named session
 # (per-name provider / named BU cloud / Lightpanda). Popped before the subprocess launches — never exported.
 _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
+# Set by the packaged-Chromium resolver to that browser's session-cache key, so browser_exec can relaunch it
+# headed after a bot check. Popped before the subprocess launches — never exported.
+_MANAGED_KEY_SENTINEL = "_HERMES_BU_MANAGED_KEY"
+# Title of Cloudflare's challenge interstitial (the one a headless Chromium never gets past).
+_BOT_CHECK_TITLE = "just a moment"
 
 # Prepended to the model's code for named sessions on SHARED browsers (a /browser connect CDP override): the
 # harness daemon attaches to the first existing page at startup, so two fresh named daemons can land on the
@@ -69,6 +74,25 @@ def _hermes_ensure_own_tab():
         pass
 _hermes_ensure_own_tab()
 del _hermes_ensure_own_tab
+"""
+
+# Prepended to the model's code when the packaged Chromium runs headed. The harness opens tabs in the
+# background so it never disturbs a user's own browser, but Chromium delivers CDP key events (fill_input,
+# press_key) only to the visible tab: a headed fill_input typed nothing (Homestead login, 2026-10-16).
+# This window belongs to Hermes, so show each tab the code opens or switches to.
+_SHOW_TABS_PREAMBLE = """\
+# hermes: show this Hermes-owned window's working tab so key events reach it
+def _hermes_show_tabs(_new_tab, _switch_tab):
+    def new_tab(url="about:blank"):
+        tid = _new_tab(url)
+        if tid:
+            activate_tab(tid)
+        return tid
+    def switch_tab(target, activate=True):
+        return _switch_tab(target, activate=activate)
+    return new_tab, switch_tab
+new_tab, switch_tab = _hermes_show_tabs(new_tab, switch_tab)
+del _hermes_show_tabs
 """
 
 _DEFAULT_TIMEOUT_S = 300
@@ -418,6 +442,7 @@ def _resolve_managed_chromium_cdp(env: dict, task_id: Optional[str], session_nam
                 "Run `hermes tools` → Browser Automation to (re)install Chromium, or switch backends.")
     _set_cdp_env(env, cdp)
     env[_PRIVATE_BROWSER_SENTINEL] = "1"  # one Chromium per cache key: nothing to share a tab with
+    env[_MANAGED_KEY_SENTINEL] = _backend_cache_key(task_id, session_name)
     return None
 
 
@@ -525,6 +550,70 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
                                          dialog_policy=policy, dialog_timeout_s=timeout_s)
     except Exception as exc:
         logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
+
+
+def _bot_check_url(cdp: str) -> Optional[str]:
+    """URL of an open page showing Cloudflare's "Just a moment..." challenge, read from the browser's
+    CDP target list; None when there is none or the endpoint does not answer."""
+    m = re.match(r"(?:ws|http)s?://([^/]+)", cdp or "")
+    if not m:
+        return None
+    root = f"http://{m.group(1)}"
+    try:
+        import requests
+        from agent.proxy_bypass import loopback_request_kwargs
+        targets = requests.get(f"{root}/json/list", timeout=2, **loopback_request_kwargs(root)).json()
+    except Exception as e:
+        logger.debug("bot-check probe failed: %s", e)
+        return None
+    for target in targets if isinstance(targets, list) else []:
+        if (target.get("type") == "page" and _BOT_CHECK_TITLE in str(target.get("title") or "").casefold()
+                and str(target.get("url") or "").startswith(("http://", "https://"))):
+            return str(target["url"])
+    return None
+
+
+def _managed_session_headed(cache_key: str) -> bool:
+    """True when the packaged Chromium behind ``cache_key`` launches headed (config, env, or a bot-check relaunch)."""
+    try:
+        from tools import browser_tool as bt
+        from tools.browser_tool_cloud import _is_headed_mode
+    except Exception:  # pragma: no cover — stubbed browser_tool in tests
+        return False
+    return cache_key in bt._headed_session_keys or _is_headed_mode()
+
+
+def _relaunch_headed_after_bot_check(env: dict, task_id: Optional[str], session: str, cache_key: str) -> Optional[str]:
+    """Cloudflare keeps a headless Chromium on its "Just a moment..." page however long it waits. When the
+    packaged Chromium behind ``cache_key`` shows that page and this host can open a window, close it and
+    relaunch it headed (a normal visible browser: no fingerprint changes), then re-point the vault supervisor.
+    The page is not reopened: the model's retry navigates in its own tab, so the vault fill finds one login tab.
+    Returns a notice for the model, or None when nothing was done."""
+    try:
+        from tools import browser_tool as bt
+        from tools.browser_tool_cloud import _can_show_window
+        from tools.browser_tool_lifecycle import _cleanup_single_browser_session
+    except Exception as e:  # pragma: no cover — stubbed browser_tool in tests
+        logger.debug("headed relaunch unavailable: %s", e)
+        return None
+    if _managed_session_headed(cache_key) or not _can_show_window():
+        return None
+    url = _bot_check_url(env.get("BU_CDP_WS") or env.get("BU_CDP_URL") or "")
+    if not url:
+        return None
+    logger.info("browser_exec: Cloudflare challenge on %s in headless session %s; relaunching headed", url, cache_key)
+    bt._headed_session_keys.add(cache_key)
+    _cleanup_single_browser_session(cache_key)
+    fresh: dict = {}
+    err = _resolve_managed_chromium_cdp(fresh, task_id, session)
+    if err:
+        return (f"{url} showed a Cloudflare bot check, which the background browser cannot pass, and Hermes could "
+                f"not relaunch it as a visible window: {err}")
+    _attach_vault_supervisor(fresh, task_id)
+    return (f"{url} showed a Cloudflare bot check, which the background browser cannot pass. Hermes relaunched "
+            "this session as a visible browser window on this computer; tabs and cookies from before are gone. "
+            "Run your code again from the first navigation, wait until the title is no longer \"Just a moment...\" "
+            "(usually a few seconds), then continue (logins still go through browser_vault_fill).")
 
 
 def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool) -> Optional[str]:
@@ -635,6 +724,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
     # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
+    managed_key = env.pop(_MANAGED_KEY_SENTINEL, None)
+    if managed_key and _managed_session_headed(managed_key):
+        code = _SHOW_TABS_PREAMBLE + code
     if session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
@@ -674,6 +766,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
     if stderr:
         result["stderr"] = stderr
+    if managed_key:
+        notice = _relaunch_headed_after_bot_check(env, task_id, session, managed_key)
+        if notice:
+            result["browser_notice"] = notice
     screenshot = _find_screenshot(proc.stdout, started)
     if screenshot:
         result["screenshot_path"] = screenshot

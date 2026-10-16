@@ -623,7 +623,7 @@ def _dispatch_browser_command(
         backend_args = ["--cdp", session_info["cdp_url"]]
     else:
         backend_args = ["--session", session_info["session_name"]]
-        if _cloud._is_headed_mode():
+        if _cloud._is_headed_mode() or task_id in _bt._headed_session_keys:
             backend_args.append("--headed")
         if engine != "auto" and not _bt._is_camofox_mode():
             backend_args += ["--engine", engine]
