@@ -94,6 +94,10 @@ def _hermes_show_tabs(_new_tab, _switch_tab):
     return new_tab, switch_tab
 new_tab, switch_tab = _hermes_show_tabs(new_tab, switch_tab)
 del _hermes_show_tabs
+try:
+    activate_tab(current_tab())  # the tab this call continues in (goto_url/fill_input without new_tab)
+except Exception:
+    pass
 """
 
 _DEFAULT_TIMEOUT_S = 300
@@ -610,7 +614,8 @@ def _relaunch_headed_after_bot_check(env: dict, task_id: Optional[str], session:
         if _managed_session_headed(cache_key):
             return None
         bt._headed_session_keys.add(cache_key)
-    logger.info("browser_exec: Cloudflare challenge on %s in headless session %s; relaunching headed", url, cache_key)
+    # No URL here: it may hold a vault value, and the async log formatter cannot see a served profile's registry.
+    logger.info("browser_exec: Cloudflare challenge in headless session %s; relaunching headed", cache_key)
     _cleanup_single_browser_session(cache_key)
     fresh: dict = {}
     err = _resolve_managed_chromium_cdp(fresh, task_id, session)

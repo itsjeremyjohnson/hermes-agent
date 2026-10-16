@@ -341,20 +341,26 @@ class TestCloudflareHeadedRelaunch:
         assert "browser_notice" not in second  # already headed: never relaunch in a loop
         assert launches[2:] == [("bu-named-hs", "get", True)]
         # only the headed window gets its tabs shown (key events reach visible tabs only)
-        assert "_hermes_show_tabs" not in first["output"] and "_hermes_show_tabs" in second["output"]
+        assert not first["output"].startswith(bu_cli._SHOW_TABS_PREAMBLE)
+        assert second["output"].startswith(bu_cli._SHOW_TABS_PREAMBLE)
 
-    def test_show_tabs_preamble_activates_tabs_the_code_opens(self):
+    def test_show_tabs_preamble_activates_the_working_tab_and_tabs_the_code_opens(self):
         calls = []
         ns = {
             "new_tab": lambda url="about:blank": calls.append(("new_tab", url)) or "T1",
             "switch_tab": lambda target, activate=False: calls.append(("switch_tab", target, activate)),
             "activate_tab": lambda tid: calls.append(("activate_tab", tid)),
+            "current_tab": lambda: "T0",
         }
         exec(bu_cli._SHOW_TABS_PREAMBLE + "new_tab('https://example.com')\nswitch_tab('T2')\n", ns)
-        assert calls == [("new_tab", "https://example.com"), ("activate_tab", "T1"), ("switch_tab", "T2", True)]
+        assert calls == [("activate_tab", "T0"), ("new_tab", "https://example.com"), ("activate_tab", "T1"),
+                         ("switch_tab", "T2", True)]
 
-    def test_notice_redacts_vault_secret_in_challenged_url(self, tmp_path, monkeypatch):
+    def test_challenged_url_with_vault_secret_reaches_neither_notice_nor_logs(self, tmp_path, monkeypatch, caplog):
+        import logging
         from agent import redact
+
+        caplog.set_level(logging.DEBUG)
 
         secret = "vault-filled-password-512881"
         self._setup(tmp_path, monkeypatch, title="Just a moment...", url=f"https://example.com/login?p={secret}")
@@ -366,6 +372,8 @@ class TestCloudflareHeadedRelaunch:
 
         assert "visible browser window" in result["browser_notice"]
         assert secret not in json.dumps(result)
+        # raw record messages: a served profile's async formatter cannot redact its own vault values
+        assert not [r for r in caplog.records if secret in r.getMessage()]
 
     def test_concurrent_challenged_calls_relaunch_once(self, tmp_path, monkeypatch):
         import threading
