@@ -288,7 +288,7 @@ class TestCloudflareHeadedRelaunch:
 
     URL = "https://www.homestead.com/~site/login/"
 
-    def _setup(self, tmp_path, monkeypatch, *, title, display=True):
+    def _setup(self, tmp_path, monkeypatch, *, title, display=True, url=URL):
         import requests
         import tools.browser_tool as bt
 
@@ -297,7 +297,6 @@ class TestCloudflareHeadedRelaunch:
         monkeypatch.setattr(bt_cloud, "_is_headed_mode", lambda: False)
         monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
         monkeypatch.setattr("tools.browser_tool_cdp._resolve_cdp_override", lambda url: url)
-        monkeypatch.setattr(sys, "platform", "linux")
         for var in ("DISPLAY", "WAYLAND_DISPLAY"):
             monkeypatch.delenv(var, raising=False)
         if display:
@@ -305,18 +304,19 @@ class TestCloudflareHeadedRelaunch:
 
         # agent-browser boundary: record each launch and whether it starts headed (the session layer passes
         # --headed for keys in _headed_session_keys; TestHeadedFlagInjection covers that argv).
+        # Each launch gets its own endpoint, as a relaunched Chromium does.
         launches = []
 
         def fake_run(task_id, command, args=None, timeout=None, _engine_override=None):
             launches.append((task_id, command, task_id in bt._headed_session_keys))
-            return {"success": True, "data": {"cdpUrl": "ws://127.0.0.1:47000/devtools/browser/x"}}
+            return {"success": True, "data": {"cdpUrl": f"ws://127.0.0.1:47000/devtools/browser/b{len(launches)}"}}
 
         monkeypatch.setattr(bt_session, "_run_browser_command", fake_run)
         probes = []
 
         class _Resp:
             def json(self):
-                return [{"type": "page", "title": title, "url": TestCloudflareHeadedRelaunch.URL}]
+                return [{"type": "page", "title": title, "url": url}]
 
         def fake_get(url, **kw):
             probes.append(url)
@@ -334,7 +334,8 @@ class TestCloudflareHeadedRelaunch:
         assert self.URL in first["browser_notice"] and "visible browser window" in first["browser_notice"]
         assert probes[0] == "http://127.0.0.1:47000/json/list"
         assert launches == [("bu-named-hs", "get", False), ("bu-named-hs", "get", True)]
-        assert _fake_supervisor_registry[-1][0] == "t1"  # vault fills reach the relaunched browser
+        # vault fills reach the relaunched browser, not the closed one
+        assert _fake_supervisor_registry[-1] == ("t1", "ws://127.0.0.1:47000/devtools/browser/b2")
 
         second = json.loads(bu_cli.browser_exec("print(1)", session="hs", task_id="t1"))
         assert "browser_notice" not in second  # already headed: never relaunch in a loop
@@ -352,9 +353,47 @@ class TestCloudflareHeadedRelaunch:
         exec(bu_cli._SHOW_TABS_PREAMBLE + "new_tab('https://example.com')\nswitch_tab('T2')\n", ns)
         assert calls == [("new_tab", "https://example.com"), ("activate_tab", "T1"), ("switch_tab", "T2", True)]
 
+    def test_notice_redacts_vault_secret_in_challenged_url(self, tmp_path, monkeypatch):
+        from agent import redact
+
+        secret = "vault-filled-password-512881"
+        self._setup(tmp_path, monkeypatch, title="Just a moment...", url=f"https://example.com/login?p={secret}")
+        redact.register_vault_redaction_value(secret)
+        try:
+            result = json.loads(bu_cli.browser_exec("print(1)", session="hs", task_id="t1"))
+        finally:
+            redact.clear_vault_redaction_values()
+
+        assert "visible browser window" in result["browser_notice"]
+        assert secret not in json.dumps(result)
+
+    def test_concurrent_challenged_calls_relaunch_once(self, tmp_path, monkeypatch):
+        import threading
+
+        launches, _ = self._setup(tmp_path, monkeypatch, title="Just a moment...")
+        barrier = threading.Barrier(2)
+        real_probe = bu_cli._bot_check_url
+
+        def probe_together(cdp):  # both callers pass the headed check before either claims the key
+            url = real_probe(cdp)
+            barrier.wait(timeout=5)
+            return url
+
+        monkeypatch.setattr(bu_cli, "_bot_check_url", probe_together)
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(
+            json.loads(bu_cli.browser_exec("print(1)", session="hs", task_id="t1")))) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert sum("browser_notice" in r for r in results) == 1
+        assert sum(1 for _, _, headed in launches if headed) == 1
+
     @pytest.mark.parametrize("title,display", [
-        ("Homestead | Login", True),       # no challenge
-        ("Just a moment...", False),       # challenge, but a display-less Linux host cannot open a window
+        ("Homestead | Login", True),  # no challenge
+        pytest.param("Just a moment...", False, marks=pytest.mark.linux_only),  # display-less Linux: no window
     ])
     def test_no_relaunch_without_challenge_or_display(self, tmp_path, monkeypatch, title, display):
         launches, _ = self._setup(tmp_path, monkeypatch, title=title, display=display)

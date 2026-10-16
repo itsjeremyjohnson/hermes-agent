@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -573,6 +574,9 @@ def _bot_check_url(cdp: str) -> Optional[str]:
     return None
 
 
+_HEADED_RELAUNCH_LOCK = threading.Lock()
+
+
 def _managed_session_headed(cache_key: str) -> bool:
     """True when the packaged Chromium behind ``cache_key`` launches headed (config, env, or a bot-check relaunch)."""
     try:
@@ -601,8 +605,12 @@ def _relaunch_headed_after_bot_check(env: dict, task_id: Optional[str], session:
     url = _bot_check_url(env.get("BU_CDP_WS") or env.get("BU_CDP_URL") or "")
     if not url:
         return None
+    # Concurrent agents sharing a session name share this key: claim it atomically so only one relaunches.
+    with _HEADED_RELAUNCH_LOCK:
+        if _managed_session_headed(cache_key):
+            return None
+        bt._headed_session_keys.add(cache_key)
     logger.info("browser_exec: Cloudflare challenge on %s in headless session %s; relaunching headed", url, cache_key)
-    bt._headed_session_keys.add(cache_key)
     _cleanup_single_browser_session(cache_key)
     fresh: dict = {}
     err = _resolve_managed_chromium_cdp(fresh, task_id, session)
@@ -768,8 +776,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         result["stderr"] = stderr
     if managed_key:
         notice = _relaunch_headed_after_bot_check(env, task_id, session, managed_key)
-        if notice:
-            result["browser_notice"] = notice
+        if notice:  # carries a page URL, which may hold a vault-filled value: same boundary as stdout
+            result["browser_notice"] = redact_sensitive_text(notice, force=True)
     screenshot = _find_screenshot(proc.stdout, started)
     if screenshot:
         result["screenshot_path"] = screenshot
