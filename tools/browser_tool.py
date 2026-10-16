@@ -412,6 +412,10 @@ MAX_INACTIVITY_CLEANUP_FAILURES = 3
 # See #72205.
 _suspect_browser_sessions: Dict[str, str] = {}
 
+# Session keys whose local Chromium was relaunched headed because a bot check (Cloudflare
+# "Just a moment...") blocked the headless one; later launches for these keys pass --headed.
+_headed_session_keys: set = set()
+
 
 class _BrowserSessionBackend:
     """``agent.deadline.SuspectableBackend`` adapter for one cached session key: the

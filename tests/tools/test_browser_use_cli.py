@@ -282,6 +282,144 @@ class TestVaultSupervisorAttach:
         assert _fake_supervisor_registry == [("t-vault", "ws://127.0.0.1:47000/devtools/browser/t-vault")]
 
 
+class TestCloudflareHeadedRelaunch:
+    """Cloudflare keeps headless Chromium on "Just a moment..." (Homestead login, 2026-10-15). browser_exec
+    relaunches that session's packaged Chromium headed, once, when the host can show a window."""
+
+    URL = "https://www.homestead.com/~site/login/"
+
+    def _setup(self, tmp_path, monkeypatch, *, title, display=True, url=URL):
+        import requests
+        import tools.browser_tool as bt
+
+        monkeypatch.setattr(bt, "_headed_session_keys", set())
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+        monkeypatch.setattr(bt_cloud, "_is_headed_mode", lambda: False)
+        monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
+        monkeypatch.setattr("tools.browser_tool_cdp._resolve_cdp_override", lambda url: url)
+        for var in ("DISPLAY", "WAYLAND_DISPLAY"):
+            monkeypatch.delenv(var, raising=False)
+        if display:
+            monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
+
+        # agent-browser boundary: record each launch and whether it starts headed (the session layer passes
+        # --headed for keys in _headed_session_keys; TestHeadedFlagInjection covers that argv).
+        # Each launch gets its own endpoint, as a relaunched Chromium does.
+        launches = []
+
+        def fake_run(task_id, command, args=None, timeout=None, _engine_override=None):
+            launches.append((task_id, command, task_id in bt._headed_session_keys))
+            return {"success": True, "data": {"cdpUrl": f"ws://127.0.0.1:47000/devtools/browser/b{len(launches)}"}}
+
+        monkeypatch.setattr(bt_session, "_run_browser_command", fake_run)
+        probes = []
+
+        class _Resp:
+            def json(self):
+                return [{"type": "page", "title": title, "url": url}]
+
+        def fake_get(url, **kw):
+            probes.append(url)
+            return _Resp()
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        # Runs the submitted code against stub tab helpers that print which tab they make visible.
+        stubs = tmp_path / "stubs.py"
+        stubs.write_text(
+            "def current_tab(): return 'T0'\n"
+            "def activate_tab(t): print('activated', t)\n"
+            "def new_tab(url='about:blank'): return 'T1'\n"
+            "def switch_tab(t, activate=False): activate and print('activated', t)\n", encoding="utf-8")
+        cli = _fake_cli(tmp_path, f'exec "{sys.executable}" -c "import sys; ns={{}}; '
+                                  f'exec(open(\'{stubs}\').read(), ns); exec(sys.stdin.read(), ns)"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        return launches, probes
+
+    def test_challenge_relaunches_the_session_headed_once(self, tmp_path, monkeypatch, _fake_supervisor_registry):
+        launches, probes = self._setup(tmp_path, monkeypatch, title="Just a moment...")
+
+        first = json.loads(bu_cli.browser_exec("print(1)", session="hs", task_id="t1"))
+        assert self.URL in first["browser_notice"] and "visible browser window" in first["browser_notice"]
+        assert probes[0] == "http://127.0.0.1:47000/json/list"
+        assert launches == [("bu-named-hs", "get", False), ("bu-named-hs", "get", True)]
+        # vault fills reach the relaunched browser, not the closed one
+        assert _fake_supervisor_registry[-1] == ("t1", "ws://127.0.0.1:47000/devtools/browser/b2")
+
+        second = json.loads(bu_cli.browser_exec("print(1)", session="hs", task_id="t1"))
+        assert "browser_notice" not in second  # already headed: never relaunch in a loop
+        assert launches[2:] == [("bu-named-hs", "get", True)]
+        # only the headed window gets its tabs shown (key events reach visible tabs only)
+        assert "activated" not in first["output"]  # headless: the harness keeps its background tabs
+        assert "activated T0" in second["output"]  # headed: the working tab is shown so key events land
+
+    def test_show_tabs_preamble_activates_the_working_tab_and_tabs_the_code_opens(self):
+        calls = []
+        ns = {
+            "new_tab": lambda url="about:blank": calls.append(("new_tab", url)) or "T1",
+            "switch_tab": lambda target, activate=False: calls.append(("switch_tab", target, activate)),
+            "activate_tab": lambda tid: calls.append(("activate_tab", tid)),
+            "current_tab": lambda: "T0",
+        }
+        exec(bu_cli._SHOW_TABS_PREAMBLE + "new_tab('https://example.com')\nswitch_tab('T2')\n", ns)
+        assert calls == [("activate_tab", "T0"), ("new_tab", "https://example.com"), ("activate_tab", "T1"),
+                         ("switch_tab", "T2", True)]
+
+    def test_challenged_url_with_vault_secret_reaches_neither_notice_nor_logs(self, tmp_path, monkeypatch, caplog):
+        import logging
+        from agent import redact
+
+        caplog.set_level(logging.DEBUG)
+
+        secret = "vault-filled-password-512881"
+        self._setup(tmp_path, monkeypatch, title="Just a moment...", url=f"https://example.com/login?p={secret}")
+        redact.register_vault_redaction_value(secret)
+        try:
+            result = json.loads(bu_cli.browser_exec("print(1)", session="hs", task_id="t1"))
+        finally:
+            redact.clear_vault_redaction_values()
+
+        assert "visible browser window" in result["browser_notice"]
+        assert secret not in json.dumps(result)
+        # raw record messages: a served profile's async formatter cannot redact its own vault values
+        assert not [r for r in caplog.records if secret in r.getMessage()]
+
+    def test_concurrent_challenged_calls_relaunch_once(self, tmp_path, monkeypatch):
+        import threading
+
+        launches, _ = self._setup(tmp_path, monkeypatch, title="Just a moment...")
+        barrier = threading.Barrier(2)
+        real_probe = bu_cli._bot_check_url
+
+        def probe_together(cdp):  # both callers pass the headed check before either claims the key
+            url = real_probe(cdp)
+            barrier.wait(timeout=5)
+            return url
+
+        monkeypatch.setattr(bu_cli, "_bot_check_url", probe_together)
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(
+            json.loads(bu_cli.browser_exec("print(1)", session="hs", task_id="t1")))) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert sum("browser_notice" in r for r in results) == 1
+        assert sum(1 for _, _, headed in launches if headed) == 1
+
+    @pytest.mark.parametrize("title,display", [
+        ("Homestead | Login", True),  # no challenge
+        pytest.param("Just a moment...", False, marks=pytest.mark.linux_only),  # display-less Linux: no window
+    ])
+    def test_no_relaunch_without_challenge_or_display(self, tmp_path, monkeypatch, title, display):
+        launches, _ = self._setup(tmp_path, monkeypatch, title=title, display=display)
+
+        result = json.loads(bu_cli.browser_exec("print(1)", session="hs", task_id="t1"))
+
+        assert result["success"] is True and "browser_notice" not in result
+        assert launches == [("bu-named-hs", "get", False)]
+
+
 class TestVaultEgressRedaction:
     def test_exec_redacts_registered_vault_secret_from_stdout_and_stderr(self, tmp_path, monkeypatch):
         """A browser_exec page read must not return a vault-filled value to model history."""
@@ -674,19 +812,19 @@ class TestOwnTabPreamble:
         assert result["success"] is True
         assert "_hermes_ensure_own_tab" not in result["output"]
 
-    def test_sentinel_never_reaches_subprocess_env(self, tmp_path, monkeypatch):
-        import tools.browser_tool as bt
-
+    @pytest.mark.parametrize("provider", [True, False])
+    def test_sentinels_never_reach_subprocess_env(self, tmp_path, monkeypatch, provider):
         monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
-        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: object())
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: object() if provider else None)
         monkeypatch.setattr(
             bt_session, "_get_session_info",
             lambda key: {"cdp_url": "wss://browser.example/cdp/" + key},
         )
-        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "sentinel:${_HERMES_BU_PRIVATE_BROWSER:-unset}"\n')
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\n'
+                        'echo "sentinel:${_HERMES_BU_PRIVATE_BROWSER:-unset}:${_HERMES_BU_MANAGED_KEY:-unset}"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
-        assert "sentinel:unset" in result["output"]
+        assert "sentinel:unset:unset" in result["output"]
 
     def test_preamble_is_valid_python(self):
         import ast

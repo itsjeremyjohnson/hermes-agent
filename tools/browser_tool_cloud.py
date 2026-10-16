@@ -5,6 +5,7 @@ Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt
 from __future__ import annotations
 
 import os
+import sys
 from typing import Callable, Optional
 
 from agent.browser_provider import BrowserProvider as CloudBrowserProvider
@@ -210,6 +211,11 @@ def _is_headed_mode() -> bool:
         headed = _bt._browser_cfg("headed", False, lambda v: False if v is None else str(v).strip().lower() in ("true", "1", "yes"), "browser.headed from config")
         return headed or os.environ.get("AGENT_BROWSER_HEADED", "").strip().lower() in ("true", "1", "yes")
     return _memo(_bt, "_headed_mode_resolved", "_cached_headed_mode", compute)
+
+
+def _can_show_window() -> bool:
+    """True when a headed browser can open a window: any non-Linux host, or Linux with a display."""
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) or not sys.platform.startswith("linux")
 
 
 def _should_inject_engine(engine: str) -> bool:

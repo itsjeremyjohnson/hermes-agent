@@ -9,7 +9,6 @@ through ``_bt`` (resolved per call — never import ``tools.browser_tool`` at im
 import os
 import re
 import subprocess
-import sys
 import time
 from typing import Optional, Tuple
 from agent.proxy_bypass import loopback_request_kwargs
@@ -165,8 +164,7 @@ def _launch_real_profile_chrome(real_binary: str, copy_dir: str) -> Tuple[Option
     except OSError:
         pass
     chrome_argv = [real_binary, f"--user-data-dir={copy_dir}", *_REAL_PROFILE_CHROME_FLAGS]
-    _has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    if not (_cloud._is_headed_mode() and (_has_display or not sys.platform.startswith("linux"))):
+    if not (_cloud._is_headed_mode() and _cloud._can_show_window()):
         chrome_argv.append("--headless=new")
     try:
         chrome_proc = subprocess.Popen(chrome_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
